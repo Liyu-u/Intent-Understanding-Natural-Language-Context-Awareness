@@ -856,6 +856,28 @@ class HybridRouter:
         self._llm_planner = llm_planner
         self._settings = get_settings()
 
+    @staticmethod
+    def _record_engine_trace(bt: BehaviorTree, *, requested: str,
+                             actual: str, fallback: bool = False,
+                             reason: Optional[str] = None) -> BehaviorTree:
+        """Attach a uniform, auditable engine decision to every BT result."""
+        metadata = bt.metadata if isinstance(bt.metadata, dict) else {}
+        metadata["planner"] = actual
+        trace = metadata.get("engine_trace")
+        if not isinstance(trace, dict):
+            trace = {}
+        trace.update({
+            "requested_engine": requested,
+            "actual_engine": actual,
+            "llm_call_attempted": bool(trace.get("llm_call_attempted", False)),
+            "llm_call_succeeded": bool(trace.get("llm_call_succeeded", False)),
+            "fallback_used": fallback,
+            "fallback_reason": reason,
+        })
+        metadata["engine_trace"] = trace
+        bt.metadata = metadata
+        return bt
+
     def plan(
         self,
         instruction: str,
@@ -872,18 +894,24 @@ class HybridRouter:
 
         # ── 模式 1: 纯规则 ──
         if engine == "rule":
-            return self._rule_planner.plan(instruction, scene=scene, memory_context=memory_context)
+            bt = self._rule_planner.plan(instruction, scene=scene, memory_context=memory_context)
+            return self._record_engine_trace(bt, requested="rule", actual="RuleEngine")
 
         # ── 模式 2: 纯 LLM ──
         if engine == "llm":
             if not self._llm_planner or not self._llm_planner.is_available:
                 logger.warning("LLM engine selected but not available, falling back to rule")
-                return self._rule_planner.plan(instruction, scene=scene, memory_context=memory_context)
+                bt = self._rule_planner.plan(instruction, scene=scene, memory_context=memory_context)
+                return self._record_engine_trace(bt, requested="llm", actual="RuleEngine",
+                                                 fallback=True, reason="llm_unavailable")
             try:
-                return self._llm_planner.plan(instruction, scene=scene, memory_context=memory_context)
+                bt = self._llm_planner.plan(instruction, scene=scene, memory_context=memory_context)
+                return self._record_engine_trace(bt, requested="llm", actual=bt.metadata.get("planner", "LLM"))
             except LLMPlannerError as e:
                 logger.warning(f"LLM planner failed: {e}, falling back to rule")
-                return self._rule_planner.plan(instruction, scene=scene, memory_context=memory_context)
+                bt = self._rule_planner.plan(instruction, scene=scene, memory_context=memory_context)
+                return self._record_engine_trace(bt, requested="llm", actual="RuleEngine",
+                                                 fallback=True, reason=str(e))
 
         # ── 模式 3: Hybrid（规则优先 + LLM 兜底）──
         if engine == "hybrid":
@@ -893,19 +921,26 @@ class HybridRouter:
 
             if confidence >= self._settings.rule_confidence_threshold:
                 logger.info(f"Rule planner confidence={confidence:.2f} >= threshold, using rule")
-                return rule_bt
+                return self._record_engine_trace(rule_bt, requested="hybrid", actual="RuleEngine",
+                                                 reason=f"rule_confidence={confidence:.2f}")
 
             # 低置信度，尝试 LLM
             logger.info(f"Rule planner confidence={confidence:.2f} < threshold, falling back to LLM")
             if self._llm_planner and self._llm_planner.is_available:
                 try:
-                    return self._llm_planner.plan(instruction, scene=scene, memory_context=memory_context)
+                    bt = self._llm_planner.plan(instruction, scene=scene, memory_context=memory_context)
+                    return self._record_engine_trace(bt, requested="hybrid", actual=bt.metadata.get("planner", "LLM"))
                 except LLMPlannerError as e:
                     logger.warning(f"LLM fallback failed: {e}, using rule result")
-            return rule_bt
+                    return self._record_engine_trace(rule_bt, requested="hybrid", actual="RuleEngine",
+                                                     fallback=True, reason=str(e))
+            return self._record_engine_trace(rule_bt, requested="hybrid", actual="RuleEngine",
+                                             fallback=True, reason="llm_unavailable")
 
         # 默认：规则
-        return self._rule_planner.plan(instruction, scene=scene, memory_context=memory_context)
+        bt = self._rule_planner.plan(instruction, scene=scene, memory_context=memory_context)
+        return self._record_engine_trace(bt, requested=engine or "unknown", actual="RuleEngine",
+                                         fallback=True, reason="unknown_engine")
 
     @staticmethod
     def _estimate_rule_confidence(instruction: str, bt: BehaviorTree) -> float:

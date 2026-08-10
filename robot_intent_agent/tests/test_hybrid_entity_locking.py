@@ -1,6 +1,7 @@
 """Regression tests for the Hybrid semantic/grounding boundary."""
 
 from robot_intent_agent.planner.llm_planner import normalize_intent_frame
+from robot_intent_agent.planner.llm_planner import HybridRouter
 from robot_intent_agent.schemas.intent_frame import IntentFrame
 from robot_intent_agent.scene_builder import RawObjectPercept, SemanticSceneBuilder
 from robot_intent_agent.task_semantics import load_parsed_task_from_bt
@@ -49,3 +50,14 @@ def test_hybrid_clears_and_rebinds_llm_entity_id():
     expected_id = next(obj.id for obj in scene.objects if obj.name == "red cup")
     assert task.theme.entity_id == expected_id
     assert any("cleared_llm_entity_id:theme=tray-01" in n for n in task.notes)
+
+
+def test_llm_unavailable_records_safe_rule_fallback():
+    router = HybridRouter(llm_planner=None)
+    router._settings.planner_engine = "llm"
+    bt = router.plan("抓住 red cup")
+    trace = bt.metadata["engine_trace"]
+    assert trace["requested_engine"] == "llm"
+    assert trace["actual_engine"] == "RuleEngine"
+    assert trace["fallback_used"] is True
+    assert trace["fallback_reason"] == "llm_unavailable"
