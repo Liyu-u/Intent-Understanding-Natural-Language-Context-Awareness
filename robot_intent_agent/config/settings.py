@@ -92,3 +92,8 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """获取全局配置单例"""
     return Settings()
+
+
+def resolve_deepseek_api_key(key_override: str = "") -> str:
+    """Resolve a DeepSeek key consistently without exposing it in source code."""
+    return key_override.strip() or get_settings().deepseek_api_key.strip()

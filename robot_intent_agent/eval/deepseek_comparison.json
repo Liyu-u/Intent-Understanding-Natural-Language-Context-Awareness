@@ -5,7 +5,7 @@
       "passed": 4,
       "pass_rate": 0.4,
       "critical_errors": 0,
-      "avg_latency_ms": 2.3
+      "avg_latency_ms": 4.0
     },
     "deepseek": {
       "passed": 4,
@@ -14,7 +14,7 @@
       "fallback_count": 10,
       "fallback_rate": 1.0,
       "exceptions": 0,
-      "avg_latency_ms": 2.4
+      "avg_latency_ms": 4.4
     },
     "agreement": {
       "action_match": 1.0,
@@ -37,7 +37,7 @@
         "force_n": 1.05,
         "velocity_ms": 0.07500000000000001,
         "errors": [],
-        "elapsed_ms": 2.5072097778320312
+        "elapsed_ms": 4.033088684082031
       },
       "deepseek": {
         "action": "GRASP",
@@ -50,7 +50,7 @@
         "force_n": 1.05,
         "velocity_ms": 0.07500000000000001,
         "errors": [],
-        "elapsed_ms": 2.012014389038086,
+        "elapsed_ms": 3.999471664428711,
         "fallback_used": true,
         "fallback_reason": "No API key — using RuleEngine",
         "exception": ""
@@ -82,7 +82,7 @@
           "[error] GROUNDING:AMBIGUOUS_GROUNDING_FORCED: Ambiguous grounding detected: clarification_needed:theme=你指的是transparent色的cup还是brown色的box？. Theme selection requires clarification.",
           "[error] EXECUTABILITY:NON_DISPATCHABLE_STATUS: Plan status NEEDS_CLARIFICATION is not dispatchable"
         ],
-        "elapsed_ms": 2.5436878204345703
+        "elapsed_ms": 3.058910369873047
       },
       "deepseek": {
         "action": "FETCH",
@@ -106,7 +106,7 @@
           "[error] GROUNDING:AMBIGUOUS_GROUNDING_FORCED: Ambiguous grounding detected: clarification_needed:theme=你指的是transparent色的cup还是brown色的box？. Theme selection requires clarification.",
           "[error] EXECUTABILITY:NON_DISPATCHABLE_STATUS: Plan status NEEDS_CLARIFICATION is not dispatchable"
         ],
-        "elapsed_ms": 1.5180110931396484,
+        "elapsed_ms": 2.518177032470703,
         "fallback_used": true,
         "fallback_reason": "No API key — using RuleEngine",
         "exception": ""
@@ -131,7 +131,7 @@
           "[error] GROUNDING:MISSING_RECIPIENT_POSE: Recipient identified but no executable recipient_pose_or_handover_zone available",
           "[error] EXECUTABILITY:NON_DISPATCHABLE_STATUS: Plan status NEEDS_CLARIFICATION is not dispatchable"
         ],
-        "elapsed_ms": 2.5148391723632812
+        "elapsed_ms": 4.516839981079102
       },
       "deepseek": {
         "action": "HANDOVER",
@@ -148,7 +148,7 @@
           "[error] GROUNDING:MISSING_RECIPIENT_POSE: Recipient identified but no executable recipient_pose_or_handover_zone available",
           "[error] EXECUTABILITY:NON_DISPATCHABLE_STATUS: Plan status NEEDS_CLARIFICATION is not dispatchable"
         ],
-        "elapsed_ms": 3.010272979736328,
+        "elapsed_ms": 3.000974655151367,
         "fallback_used": true,
         "fallback_reason": "No API key — using RuleEngine",
         "exception": ""
@@ -169,7 +169,7 @@
         "force_n": 1.05,
         "velocity_ms": 0.07500000000000001,
         "errors": [],
-        "elapsed_ms": 2.041339874267578
+        "elapsed_ms": 5.026578903198242
       },
       "deepseek": {
         "action": "PLACE",
@@ -182,7 +182,7 @@
         "force_n": 1.05,
         "velocity_ms": 0.07500000000000001,
         "errors": [],
-        "elapsed_ms": 2.5281906127929688,
+        "elapsed_ms": 6.76417350769043,
         "fallback_used": true,
         "fallback_reason": "No API key — using RuleEngine",
         "exception": ""
@@ -205,7 +205,7 @@
         "errors": [
           "[error] EXECUTABILITY:NON_DISPATCHABLE_STATUS: Plan status NEEDS_CLARIFICATION is not dispatchable"
         ],
-        "elapsed_ms": 3.0059814453125
+        "elapsed_ms": 6.498575210571289
       },
       "deepseek": {
         "action": "GRASP",
@@ -220,7 +220,7 @@
         "errors": [
           "[error] EXECUTABILITY:NON_DISPATCHABLE_STATUS: Plan status NEEDS_CLARIFICATION is not dispatchable"
         ],
-        "elapsed_ms": 2.504110336303711,
+        "elapsed_ms": 8.029460906982422,
         "fallback_used": true,
         "fallback_reason": "No API key — using RuleEngine",
         "exception": ""
@@ -242,7 +242,7 @@
         "force_n": 5.05,
         "velocity_ms": 0.175,
         "errors": [],
-        "elapsed_ms": 2.5701522827148438
+        "elapsed_ms": 4.519939422607422
       },
       "deepseek": {
         "action": "DYNAMIC_GRASP",
@@ -256,7 +256,7 @@
         "force_n": 5.05,
         "velocity_ms": 0.175,
         "errors": [],
-        "elapsed_ms": 2.5420188903808594,
+        "elapsed_ms": 4.503011703491211,
         "fallback_used": true,
         "fallback_reason": "No API key — using RuleEngine",
         "exception": ""
@@ -287,7 +287,7 @@
           "[error] GROUNDING:AMBIGUOUS_GROUNDING_FORCED: Ambiguous grounding detected: clarification_needed:theme=你指的是brown色的block吗？. Theme selection requires clarification.",
           "[error] EXECUTABILITY:NON_DISPATCHABLE_STATUS: Plan status NEEDS_CLARIFICATION is not dispatchable"
         ],
-        "elapsed_ms": 0.9989738464355469
+        "elapsed_ms": 2.006053924560547
       },
       "deepseek": {
         "action": "FETCH",
@@ -310,7 +310,7 @@
           "[error] GROUNDING:AMBIGUOUS_GROUNDING_FORCED: Ambiguous grounding detected: clarification_needed:theme=你指的是brown色的block吗？. Theme selection requires clarification.",
           "[error] EXECUTABILITY:NON_DISPATCHABLE_STATUS: Plan status NEEDS_CLARIFICATION is not dispatchable"
         ],
-        "elapsed_ms": 1.5072822570800781,
+        "elapsed_ms": 4.009246826171875,
         "fallback_used": true,
         "fallback_reason": "No API key — using RuleEngine",
         "exception": ""
@@ -335,7 +335,7 @@
           "[error] GROUNDING:MISSING_RECIPIENT_POSE: Recipient identified but no executable recipient_pose_or_handover_zone available",
           "[error] EXECUTABILITY:NON_DISPATCHABLE_STATUS: Plan status NEEDS_CLARIFICATION is not dispatchable"
         ],
-        "elapsed_ms": 2.7894973754882812
+        "elapsed_ms": 4.047632217407227
       },
       "deepseek": {
         "action": "HANDOVER",
@@ -352,7 +352,7 @@
           "[error] GROUNDING:MISSING_RECIPIENT_POSE: Recipient identified but no executable recipient_pose_or_handover_zone available",
           "[error] EXECUTABILITY:NON_DISPATCHABLE_STATUS: Plan status NEEDS_CLARIFICATION is not dispatchable"
         ],
-        "elapsed_ms": 4.04667854309082,
+        "elapsed_ms": 4.017829895019531,
         "fallback_used": true,
         "fallback_reason": "No API key — using RuleEngine",
         "exception": ""
@@ -373,7 +373,7 @@
         "force_n": 1.05,
         "velocity_ms": 0.07500000000000001,
         "errors": [],
-        "elapsed_ms": 2.0627975463867188
+        "elapsed_ms": 4.528522491455078
       },
       "deepseek": {
         "action": "GRASP",
@@ -386,7 +386,7 @@
         "force_n": 1.05,
         "velocity_ms": 0.07500000000000001,
         "errors": [],
-        "elapsed_ms": 2.4487972259521484,
+        "elapsed_ms": 4.519462585449219,
         "fallback_used": true,
         "fallback_reason": "No API key — using RuleEngine",
         "exception": ""
@@ -415,7 +415,7 @@
           "[error] CROSS_FIELD:UNMET_ROLES_BUT_READY: Unmet roles ['theme'] but plan_status is READY",
           "[error] CROSS_FIELD:NO_THEME_BUT_DISPATCHABLE: Theme missing but plan_status is dispatchable"
         ],
-        "elapsed_ms": 1.5113353729248047
+        "elapsed_ms": 1.996755599975586
       },
       "deepseek": {
         "action": "GRASP",
@@ -436,7 +436,7 @@
           "[error] CROSS_FIELD:UNMET_ROLES_BUT_READY: Unmet roles ['theme'] but plan_status is READY",
           "[error] CROSS_FIELD:NO_THEME_BUT_DISPATCHABLE: Theme missing but plan_status is dispatchable"
         ],
-        "elapsed_ms": 2.012491226196289,
+        "elapsed_ms": 2.5174617767333984,
         "fallback_used": true,
         "fallback_reason": "No API key — using RuleEngine",
         "exception": ""

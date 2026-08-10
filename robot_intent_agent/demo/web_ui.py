@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import gradio as gr
 
-from robot_intent_agent.config.settings import get_settings
+from robot_intent_agent.config.settings import get_settings, resolve_deepseek_api_key
 from robot_intent_agent.memory import MemoryRetriever
 from robot_intent_agent.scene_builder import SemanticSceneBuilder, RawObjectPercept
 from robot_intent_agent.planner import BehaviorTreeGenerator, LLMPlanner, HybridRouter, LLMPlannerError
@@ -71,8 +71,7 @@ class Pipeline:
         self._llm_err = None
 
     def _get_llm(self, key_override=""):
-        s = get_settings()
-        k = key_override.strip() or s.deepseek_api_key
+        k = resolve_deepseek_api_key(key_override)
         if not k:
             self._llm_err = "无Key"; return None
         if self._llm is None or (key_override.strip() and self._llm._api_key != k):
@@ -563,11 +562,12 @@ def build_ui():
                         from robot_intent_agent.eval.upgraded_runner import UpgradedEvalRunner
 
                         # ── Determine planner based on engine_choice ──
-                        use_ds = ("DeepSeek" in engine_choice or "对比" in engine_choice) and bool(api_key.strip())
+                        resolved_key = resolve_deepseek_api_key(api_key)
+                        use_ds = ("DeepSeek" in engine_choice or "对比" in engine_choice) and bool(resolved_key)
                         planner = None
                         if use_ds:
                             from robot_intent_agent.planner import LLMPlanner
-                            planner = LLMPlanner(api_key=api_key.strip())
+                            planner = LLMPlanner(api_key=resolved_key)
                         requested_engine = "DeepSeek" if use_ds else "RuleEngine"
 
                         ds_paths=[]
@@ -708,11 +708,12 @@ def build_ui():
                         elif "Holdout" in ds: dp="robot_intent_agent/eval/holdout_v3.json"
 
                         # Determine engine
-                        use_ds = ("DeepSeek" in eng or "对比" in eng) and bool(ak.strip())
+                        resolved_key = resolve_deepseek_api_key(ak)
+                        use_ds = ("DeepSeek" in eng or "对比" in eng) and bool(resolved_key)
                         planner = None
                         if use_ds:
                             from robot_intent_agent.planner import LLMPlanner
-                            planner = LLMPlanner(api_key=ak.strip())
+                            planner = LLMPlanner(api_key=resolved_key)
                         requested_engine = "DeepSeek" if use_ds else "RuleEngine"
 
                         # Run ONCE
