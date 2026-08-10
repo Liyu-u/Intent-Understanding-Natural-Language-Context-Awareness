@@ -141,17 +141,24 @@ def normalize_intent_frame(frame: "IntentFrame") -> Dict[str, Any]:
             "provenance": ["llm"],
         }
 
+    normalized_destination = _normalize_entity(frame.destination)
+    normalized_support_surface = None
+    if frame.action == ActionKind.PLACE and normalized_destination is not None:
+        # PLACE destination is also the support surface consumed downstream.
+        normalized_support_surface = dict(normalized_destination)
+        normalized_support_surface["role"] = "support_surface"
+
     normalized = {
         "instruction": "",  # Will be filled by caller
         "action": action_map.get(frame.action, "CUSTOM"),
         "theme": _normalize_entity(frame.theme),
         "source": _normalize_entity(frame.source),
-        "destination": _normalize_entity(frame.destination),
+        "destination": normalized_destination,
         "recipient": _normalize_entity(frame.recipient),
         "obstacle": [_normalize_entity(p.target) for p in frame.prohibitions
                      if p.type in (ProhibitionType.NO_CONTACT, ProhibitionType.AVOID_ENTITY,
                                    ProhibitionType.AVOID_REGION, ProhibitionType.FORBID_ACTION)],
-        "support_surface": None,  # Derived from destination for PLACE
+        "support_surface": normalized_support_surface,
         "manner": frame.manner.value if frame.manner else None,
         "motion_state": {"state": "static", "speed_mps": None, "confidence": 0.0},
         "user_constraints": [_normalize_constraint(c) for c in frame.user_constraints],

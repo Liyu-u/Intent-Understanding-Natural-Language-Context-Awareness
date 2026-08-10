@@ -2929,7 +2929,13 @@ def load_parsed_task_from_bt(
             # LLM provides semantic descriptors; GroundingEngine assigns entity_id.
             # This ensures the invariant that DeepSeek never independently
             # decides the final object_id.
-            if scene is not None:
+            # RuleEngine metadata may also carry a parsed_task.  Only the
+            # LLM path needs the semantic-to-scene re-grounding boundary;
+            # re-grounding a rule result would discard its role-local IDs.
+            llm_frame = bt_metadata.get("semantic_frame_version") == "1.0"
+            llm_trace = any("deepseek" in str(engine_trace.get(k, "")).lower()
+                            for k in ("actual_engine", "requested_engine", "planner"))
+            if scene is not None and (llm_frame or llm_trace):
                 pt = _reground_llm_parsed_task(pt, instruction, scene)
 
             return pt
@@ -2966,9 +2972,26 @@ def _reground_llm_parsed_task(
     engine = GroundingEngine()
     color_hint = engine.config.derive_color_hint(instruction)
 
+    def _query(entity: Optional[SemanticEntityRef]) -> str:
+        mention = (getattr(entity, "mention", "") or "").strip() if entity else ""
+        return mention or instruction
+
+    def _clear_untrusted_id(entity: Optional[SemanticEntityRef], role: str) -> None:
+        if entity is None or (role == "recipient" and entity.entity_id == "user"):
+            return
+        if entity.entity_id is not None:
+            pt.notes.append(f"reground:cleared_llm_entity_id:{role}={entity.entity_id}")
+            entity.entity_id = None
+            entity.source = "nl"
+
+    for role_name in ("theme", "source", "destination", "support_surface", "recipient"):
+        _clear_untrusted_id(getattr(pt, role_name, None), role_name)
+    for obs in pt.obstacle or []:
+        _clear_untrusted_id(obs, "obstacle")
+
     # ── Re-ground theme ──
-    if pt.theme and pt.theme.entity_id is None:
-        theme_result = engine.ground(instruction, scene, role="theme", color_hint=color_hint)
+    if pt.theme:
+        theme_result = engine.ground(_query(pt.theme), scene, role="theme", color_hint=color_hint)
         if theme_result.selected is not None:
             pt.theme.entity_id = theme_result.selected.entity_ref.entity_id
             pt.theme.grounding_confidence = min(theme_result.selected.total_score, 1.0)
@@ -2986,8 +3009,8 @@ def _reground_llm_parsed_task(
     exclude_ids = {pt.theme.entity_id} if pt.theme and pt.theme.entity_id else set()
 
     # ── Re-ground destination ──
-    if pt.destination and pt.destination.entity_id is None:
-        dest_result = engine.ground(instruction, scene, role="destination",
+    if pt.destination:
+        dest_result = engine.ground(_query(pt.destination), scene, role="destination",
                                      exclude_ids=exclude_ids, color_hint=color_hint)
         if dest_result.selected is not None:
             pt.destination.entity_id = dest_result.selected.entity_ref.entity_id
@@ -2998,9 +3021,12 @@ def _reground_llm_parsed_task(
             pt.notes.append(f"reground:destination→{pt.destination.entity_id}")
 
     # ── Re-ground support_surface ──
-    if pt.support_surface and pt.support_surface.entity_id is None:
-        ss_result = engine.ground(instruction, scene, role="support_surface",
-                                   exclude_ids=exclude_ids)
+    if pt.support_surface:
+        support_exclude = set(exclude_ids)
+        if pt.destination and pt.destination.entity_id:
+            support_exclude.discard(pt.destination.entity_id)
+        ss_result = engine.ground(_query(pt.support_surface), scene, role="support_surface",
+                                   exclude_ids=support_exclude)
         if ss_result.selected is not None:
             pt.support_surface.entity_id = ss_result.selected.entity_ref.entity_id
             pt.support_surface.grounding_confidence = min(ss_result.selected.total_score, 1.0)
@@ -3010,6 +3036,19 @@ def _reground_llm_parsed_task(
             pt.notes.append(f"reground:support_surface→{pt.support_surface.entity_id}")
 
     # ── Re-ground obstacles ──
+    for role_name in ("source", "recipient"):
+        entity = getattr(pt, role_name, None)
+        if not entity or (role_name == "recipient" and entity.entity_id == "user"):
+            continue
+        result = engine.ground(_query(entity), scene, role=role_name, exclude_ids=exclude_ids)
+        if result.selected is not None:
+            entity.entity_id = result.selected.entity_ref.entity_id
+            entity.grounding_confidence = min(result.selected.total_score, 1.0)
+            entity.source = "scene"
+            entity.match_evidence = list(result.selected.evidence)
+            exclude_ids.add(entity.entity_id)
+            pt.notes.append(f"reground:{role_name}->{entity.entity_id}")
+
     if pt.obstacle:
         re_grounded_obstacles = []
         for obs in pt.obstacle:
@@ -3022,7 +3061,7 @@ def _reground_llm_parsed_task(
                         obs.entity_id = None
             if obs.entity_id is None:
                 # Try to ground the obstacle mention against scene
-                obs_result = engine.ground(instruction, scene, role="obstacle",
+                obs_result = engine.ground(_query(obs), scene, role="obstacle",
                                            exclude_ids=exclude_ids)
                 if obs_result.candidates:
                     # Find best matching candidate for this obstacle mention
