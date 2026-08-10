@@ -790,7 +790,9 @@ class DeepSeekSemanticParser:
         temperature: float = 0.0,
     ):
         settings = get_settings()
-        self._api_key = api_key or settings.deepseek_api_key
+        # None means "use configured key"; an explicit empty string means
+        # "disable LLM" so offline/fallback paths never call the real API.
+        self._api_key = settings.deepseek_api_key if api_key is None else api_key
         self._base_url = settings.deepseek_base_url
         self._model = model or settings.deepseek_model
         self._temperature = max(0.0, min(temperature, 2.0))

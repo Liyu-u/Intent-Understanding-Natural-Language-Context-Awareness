@@ -1,7 +1,9 @@
 """Regression tests for the Hybrid semantic/grounding boundary."""
 
+import pytest
+
 from robot_intent_agent.planner.llm_planner import normalize_intent_frame
-from robot_intent_agent.planner.llm_planner import HybridRouter
+from robot_intent_agent.planner.llm_planner import HybridRouter, LLMPlanner, LLMPlannerError
 from robot_intent_agent.schemas.intent_frame import IntentFrame
 from robot_intent_agent.scene_builder import RawObjectPercept, SemanticSceneBuilder
 from robot_intent_agent.task_semantics import load_parsed_task_from_bt
@@ -61,3 +63,65 @@ def test_llm_unavailable_records_safe_rule_fallback():
     assert trace["actual_engine"] == "RuleEngine"
     assert trace["fallback_used"] is True
     assert trace["fallback_reason"] == "llm_unavailable"
+
+
+def _intent_frame(action="GRASP", destination=None, prohibitions=None):
+    return {
+        "schema_version": "1.0.0",
+        "action": action,
+        "theme": {"mention": "red cup", "category": "cup"},
+        "destination": destination,
+        "prohibitions": prohibitions or [],
+    }
+
+
+def test_llm_response_restores_authoritative_instruction_and_planner_name():
+    planner = LLMPlanner(api_key="test-key")
+    bt = planner._parse_response({
+        "intent_frame": _intent_frame(),
+        "behavior_tree": {
+            "type": "sequence", "name": "grasp",
+            "children": [
+                {"type": "action", "name": "reach", "skill_name": "Reach", "target": "red cup"},
+                {"type": "action", "name": "grasp", "skill_name": "Grasp", "target": "red cup"},
+            ],
+        },
+    }, "抓住红色杯子")
+    assert bt.metadata["parsed_task"]["instruction"] == "抓住红色杯子"
+    assert bt.metadata["planner"] == "LLMPlanner"
+    assert bt.metadata["engine_trace"]["actual_engine"] == "LLMPlanner"
+
+
+def test_llm_bt_missing_action_skill_triggers_fallback_error():
+    planner = LLMPlanner(api_key="test-key")
+    with pytest.raises(LLMPlannerError, match="missing required skills"):
+        planner._parse_response({
+            "intent_frame": _intent_frame(action="FETCH"),
+            "behavior_tree": {
+                "type": "sequence", "name": "wrong fetch",
+                "children": [
+                    {"type": "action", "name": "reach", "skill_name": "Reach", "target": "red cup"},
+                    {"type": "action", "name": "grasp", "skill_name": "Grasp", "target": "red cup"},
+                ],
+            },
+        }, "把红色杯子拿过来")
+
+
+def test_llm_bt_missing_avoid_enforcement_triggers_fallback_error():
+    planner = LLMPlanner(api_key="test-key")
+    prohibition = {
+        "prohibition_id": "proh-test",
+        "type": "AVOID_ENTITY",
+        "target": {"mention": "box", "category": "box"},
+    }
+    with pytest.raises(LLMPlannerError, match="dropped obstacle semantics"):
+        planner._parse_response({
+            "intent_frame": _intent_frame(prohibitions=[prohibition]),
+            "behavior_tree": {
+                "type": "sequence", "name": "unsafe grasp",
+                "children": [
+                    {"type": "action", "name": "reach", "skill_name": "Reach", "target": "red cup"},
+                    {"type": "action", "name": "grasp", "skill_name": "Grasp", "target": "red cup"},
+                ],
+            },
+        }, "避开盒子，抓住红色杯子")

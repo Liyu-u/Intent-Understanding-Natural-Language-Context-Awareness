@@ -431,7 +431,9 @@ class LLMPlanner(TaskPlannerInterface):
 
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         settings = get_settings()
-        self._api_key = api_key or settings.deepseek_api_key
+        # None means "use configured key"; an explicit empty string means
+        # "disable LLM" (required for deterministic fallback tests).
+        self._api_key = settings.deepseek_api_key if api_key is None else api_key
         self._base_url = settings.deepseek_base_url
         self._model = model or settings.deepseek_model
         self._temperature = settings.deepseek_temperature
@@ -706,17 +708,22 @@ class LLMPlanner(TaskPlannerInterface):
 
         semantic_frame_version = "1.0" if intent_frame_valid else "legacy"
 
+        # The original instruction is authoritative pipeline input.  Never
+        # accept an empty or rewritten instruction from the model.
+        if isinstance(parsed_task_data, dict):
+            parsed_task_data["instruction"] = instruction
+
         metadata: Dict[str, Any] = {
             "action": raw.get("action_type") or (validated_frame.action.value if intent_frame_valid else "custom"),
             "target": target,
             "modifiers": modifiers,
             "avoid_objects": avoid_objects,
-            "planner": self.name,
+            "planner": "LLMPlanner",
             "llm_model": self._model,
             "semantic_frame_version": semantic_frame_version,
             "engine_trace": {
                 "requested_engine": "DeepSeek",
-                "actual_engine": self.name,
+                "actual_engine": "LLMPlanner",
                 "model_name": self._model,
                 "llm_call_attempted": True,
                 "llm_call_succeeded": True,
@@ -740,7 +747,54 @@ class LLMPlanner(TaskPlannerInterface):
             metadata=metadata,
         )
 
+        self._validate_semantic_contract(bt, parsed_task_data)
+
         return bt
+
+    @staticmethod
+    def _validate_semantic_contract(
+        bt: BehaviorTree, parsed_task_data: Optional[Dict[str, Any]]
+    ) -> None:
+        """Reject structurally valid but semantically incomplete LLM plans.
+
+        The LLM may understand the instruction correctly while emitting a BT
+        that drops a required action or prohibition.  Such a result must not
+        enter IR generation; raising LLMPlannerError activates the established
+        deterministic rule fallback.
+        """
+        if not isinstance(parsed_task_data, dict):
+            raise LLMPlannerError("LLM semantic contract missing parsed_task")
+
+        action = str(parsed_task_data.get("action") or "CUSTOM").upper()
+        skills = {a.skill_name for a in bt.root.flatten_actions()}
+        required_skills = {
+            "GRASP": {"Grasp"},
+            "FETCH": {"Fetch"},
+            "PLACE": {"Place"},
+            "HANDOVER": {"Handover"},
+            "TRANSFER": {"Transfer"},
+            "DYNAMIC_GRASP": {"DynamicGrasp", "WaitUntilStable"},
+        }
+        missing_skills = required_skills.get(action, set()) - skills
+        if missing_skills:
+            raise LLMPlannerError(
+                f"LLM BT missing required skills for {action}: {sorted(missing_skills)}"
+            )
+
+        if parsed_task_data.get("theme") is None:
+            raise LLMPlannerError(f"LLM semantic contract missing theme for {action}")
+
+        if action == "PLACE" and parsed_task_data.get("support_surface") is None:
+            raise LLMPlannerError("LLM semantic contract missing support_surface for PLACE")
+
+        if action in {"FETCH", "HANDOVER", "TRANSFER"} and parsed_task_data.get("recipient") is None:
+            raise LLMPlannerError(f"LLM semantic contract missing recipient for {action}")
+
+        obstacles = [o for o in (parsed_task_data.get("obstacle") or []) if o]
+        if obstacles and not ({"Avoid", "PlanPath"} & skills):
+            raise LLMPlannerError(
+                "LLM BT dropped obstacle semantics: no Avoid/PlanPath enforcement"
+            )
 
     def _build_bt_node(self, node_json) -> BTNode:
         """递归构建 BTNode (带类型防御)"""
