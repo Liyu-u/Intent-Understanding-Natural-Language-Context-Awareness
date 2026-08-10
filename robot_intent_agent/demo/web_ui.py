@@ -38,7 +38,7 @@ from robot_intent_agent.property_inference.property_mapper import PropertyMapper
 from robot_intent_agent.task_semantics import (
     ParsedTask, ConstraintResolution, ValidationResult, PlanStatus, TaskActionKind,
 )
-from robot_intent_agent.schemas.scene import Affordance
+from robot_intent_agent.schemas.scene import Affordance, SpatialPredicate, SpatialRelation
 
 
 # ══════════════════ CSS 注入 ══════════════════
@@ -127,6 +127,13 @@ class Pipeline:
             vel_mag = (vx**2 + vy**2 + vz**2)**0.5
             vel_conf = track.get("velocity_confidence", 0) if isinstance(track, dict) else 0
             is_moving = vel_conf >= 0.7 and vel_mag > 0.01
+            candidates = obj_data.get("category_candidates") or []
+            generic_categories = {"container", "object", "unknown", "item"}
+            grounding_cat = next(
+                (c for c in candidates if isinstance(c, dict)
+                 and c.get("name") not in generic_categories),
+                top_cat,
+            )
             obs_input = {"name": top_cat["name"], "category": top_cat["name"],
                          "geometry": {"width": w, "height": h, "depth": d}, "position": [px, py, pz]}
             material_from_json = (app.get("material") if isinstance(app, dict) else None) or obj_data.get("material")
@@ -135,9 +142,20 @@ class Pipeline:
             affs = [Affordance.GRASPABLE] if sp.graspable.value else []
             if sp.fragility_level.value >= 2: affs.append(Affordance.FRAGILE)
             if sp.movable.value: affs.append(Affordance.MOVABLE)
-            raw = RawObjectPercept(name=top_cat["name"], x=px, y=py, z=pz, width=w, height=h, depth=d,
+            upstream_affordances = set(obj_data.get("affordances", []) or [])
+            if grounding_cat["name"] in {"tray", "table", "workbench", "platform", "bin"}:
+                affs.append(Affordance.FIXED)
+            if "fixed" in upstream_affordances or "support_surface" in upstream_affordances:
+                affs.append(Affordance.FIXED)
+            if "container" in upstream_affordances:
+                affs.append(Affordance.CONTAINER)
+            affs = list(dict.fromkeys(affs))
+            raw = RawObjectPercept(name=grounding_cat["name"], x=px, y=py, z=pz, width=w, height=h, depth=d,
                                    color=color_val, material=sp.material.value,
-                                   extra_attrs={"_orig_object_id": obj_id, "_speed_mps": vel_mag,
+                                   object_id=obj_id,
+                                   extra_attrs={"_orig_object_id": obj_id,
+                                                "_category_candidates": candidates,
+                                                "_speed_mps": vel_mag,
                                                 "_is_moving": is_moving, "_vel_conf": vel_conf})
             raw._affs = affs; scene_objects.append(raw)
 
@@ -145,11 +163,40 @@ class Pipeline:
         try:
             def patch(self):
                 obj = orig(self)
+                if getattr(self, "object_id", None):
+                    obj.id = self.object_id
                 if hasattr(self, '_affs') and self._affs: obj.affordances = self._affs
                 return obj
             RawObjectPercept.to_scene_object = patch
             scene = self.builder.build(scene_objects)
         finally: RawObjectPercept.to_scene_object = orig
+
+        # Preserve explicit perception relations. They are evidence from the
+        # upstream scene rather than relations guessed from language.
+        known_ids = {obj.id for obj in scene.objects}
+        existing_relations = {(r.subject, r.predicate.value, r.object) for r in scene.relations}
+        for relation in obs_data.get("relations", []) or []:
+            if not isinstance(relation, dict):
+                continue
+            subject, predicate, object_id = (
+                relation.get("subject"), relation.get("predicate"), relation.get("object")
+            )
+            if subject not in known_ids or object_id not in known_ids:
+                continue
+            try:
+                predicate_enum = SpatialPredicate(predicate)
+            except (TypeError, ValueError):
+                continue
+            key = (subject, predicate_enum.value, object_id)
+            if key not in existing_relations:
+                scene.relations.append(SpatialRelation(
+                    subject=subject,
+                    predicate=predicate_enum,
+                    object=object_id,
+                    confidence=float(relation.get("confidence", 1.0)),
+                    metadata=relation.get("metadata", {}) if isinstance(relation.get("metadata", {}), dict) else {},
+                ))
+                existing_relations.add(key)
 
         target = all_sem_props[0].category if all_sem_props else "target"
         planner_name = "RuleEngine"

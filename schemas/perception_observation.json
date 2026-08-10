@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "robot-intent/perception-observation/1.1.0",
+  "title": "PerceptionObservation",
+  "type": "object",
+  "required": ["schema_version", "objects"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "scene_id": {"type": "string"},
+    "coordinate_system": {"type": "string"},
+    "objects": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["object_id", "category_candidates", "pose"],
+        "properties": {
+          "object_id": {"type": "string", "minLength": 1},
+          "category_candidates": {"type": "array", "minItems": 1},
+          "pose": {"type": "object"},
+          "geometry": {"type": "object"},
+          "affordances": {"type": "array"},
+          "execution": {
+            "type": "object",
+            "properties": {
+              "reachable": {"type": ["boolean", "null"]},
+              "graspable": {"type": ["boolean", "null"]},
+              "placeable": {"type": ["boolean", "null"]},
+              "estimated_mass_kg": {"type": ["number", "null"], "minimum": 0},
+              "required_tool": {"type": ["string", "null"]},
+              "handover_zone_id": {"type": ["string", "null"]}
+            },
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "robot_state": {"type": "object"},
+    "execution_context": {
+      "type": "object",
+      "properties": {
+        "available_tools": {"type": "array", "items": {"type": "string"}},
+        "max_payload_kg": {"type": ["number", "null"], "minimum": 0},
+        "reachable_zone_ids": {"type": "array", "items": {"type": "string"}},
+        "handover_zones": {"type": "array"},
+        "safety_zones": {"type": "array"}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

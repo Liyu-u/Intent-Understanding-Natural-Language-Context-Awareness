@@ -1452,6 +1452,7 @@ def _extract_motion_state(text: str) -> MotionState:
 
 def _extract_obstacles(text: str, scene: Any = None, target: Optional[SemanticEntityRef] = None) -> List[SemanticEntityRef]:
     obstacles: List[SemanticEntityRef] = []
+
     normalized = _normalize_text(text)
     seen_ids: set[str] = set()
 
@@ -2524,10 +2525,31 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
     support_surface: Optional[SemanticEntityRef] = None
     obstacles: List[SemanticEntityRef] = []
 
+    # Role-local spans prevent every mentioned object from competing for every
+    # semantic role. Entity IDs are still selected exclusively from the scene.
+    role_text = {"theme": instruction, "destination": instruction,
+                 "support_surface": instruction, "obstacle": instruction}
+    if action == TaskActionKind.PLACE:
+        place_match = re.search(
+            r"把\s*([^，,。；;]+?)\s*(?:放到|放在|放入|置于)\s*"
+            r"([^，,。；;]+?)(?:上面|上|里面|里|中)?(?:[，,。；;]|$)",
+            normalized,
+        )
+        if place_match:
+            role_text["theme"] = place_match.group(1).strip()
+            role_text["destination"] = place_match.group(2).strip()
+            role_text["support_surface"] = place_match.group(2).strip()
+    obstacle_match = re.search(
+        r"(?:别碰|不要碰|不能碰|禁止接触|避开|绕开|绕过|躲开)\s*"
+        r"([^，,。；;]+)", normalized,
+    )
+    if obstacle_match:
+        role_text["obstacle"] = obstacle_match.group(1).strip()
+
     # ── Per-role grounding ──
     if scene is not None:
         # ── Theme ──
-        theme_result = engine.ground(instruction, scene, role="theme", color_hint=_color_hint)
+        theme_result = engine.ground(role_text["theme"], scene, role="theme", color_hint=_color_hint)
         if theme_result.selected is not None:
             theme = theme_result.selected.entity_ref
             theme.grounding_confidence = min(theme_result.selected.total_score, 1.0)
@@ -2542,7 +2564,7 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
         _exclude_ids: Set[str] = {theme.entity_id} if theme and theme.entity_id else set()
 
         # ── Destination ──
-        dest_result = engine.ground(instruction, scene, role="destination",
+        dest_result = engine.ground(role_text["destination"], scene, role="destination",
                                      exclude_ids=_exclude_ids, color_hint=_color_hint)
         if dest_result.selected is not None:
             destination = dest_result.selected.entity_ref
@@ -2550,7 +2572,7 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
             _exclude_ids.add(destination.entity_id)
 
         # ── Support surface ──
-        ss_result = engine.ground(instruction, scene, role="support_surface",
+        ss_result = engine.ground(role_text["support_surface"], scene, role="support_surface",
                                    exclude_ids=_exclude_ids, color_hint=_color_hint)
         if ss_result.selected is not None:
             support_surface = ss_result.selected.entity_ref
@@ -2558,7 +2580,7 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
             _exclude_ids.add(support_surface.entity_id)
 
         # ── Obstacles ──
-        obs_result = engine.ground(instruction, scene, role="obstacle",
+        obs_result = engine.ground(role_text["obstacle"], scene, role="obstacle",
                                     exclude_ids=_exclude_ids)
         if obs_result.candidates:
             for c in obs_result.candidates:
@@ -2811,7 +2833,8 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
             existing_mentions.add(neg.target_mention)
 
     # Merge legacy obstacles (dedup)
-    legacy_obstacles = _extract_obstacles(normalized, scene=scene, target=theme)
+    legacy_obstacles = ([] if obstacle_match else
+                        _extract_obstacles(normalized, scene=scene, target=theme))
     for obs in legacy_obstacles:
         if obs.entity_id and obs.entity_id not in existing_ids:
             obstacles.append(obs)

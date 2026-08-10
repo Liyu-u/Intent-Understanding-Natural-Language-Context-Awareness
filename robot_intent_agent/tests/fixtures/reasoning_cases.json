@@ -1193,7 +1193,11 @@
         "requested_force_n": 8.0,
         "resolved_force_n_le": 2.0,
         "conflict_detected": true,
-        "execution_ready": true
+        "execution_ready": false,
+        "plan_status_in": [
+          "NEEDS_CLARIFICATION",
+          "BLOCKED"
+        ]
       },
       "assertions": [
         "必须绑定到 obj_cup_001",
