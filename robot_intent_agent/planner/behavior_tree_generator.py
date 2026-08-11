@@ -253,6 +253,14 @@ class BehaviorTreeGenerator(TaskPlannerInterface):
             pipeline = ACTION_PIPELINE[legacy_action]
         else:
             pipeline = SEMANTIC_PIPELINES.get(action_kind, SEMANTIC_PIPELINES[TaskActionKind.CUSTOM])
+        # PLACE normally assumes an object is already held.  Composite natural
+        # language instructions explicitly asking to pick and then place need
+        # both manipulation stages in the executable tree.
+        if action_kind == TaskActionKind.PLACE and re.search(
+            r"(?:拿起|抓取|抓|拿到|取起|取).*(?:放到|放在|放入|放进|放回|摆放|置于)",
+            instruction,
+        ):
+            pipeline = ["Reach", "Grasp", "Place"]
 
         # 3. 注入 Memory 上下文参数
         memory_params = self._merge_memory(memory_context or [])

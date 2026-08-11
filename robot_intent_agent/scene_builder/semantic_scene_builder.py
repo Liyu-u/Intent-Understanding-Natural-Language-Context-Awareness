@@ -134,6 +134,12 @@ class RawObjectPercept:
         label = self._infer_label()
         affordances = self._infer_affordances(label)
         specific_class, parent_class, parent_classes = self._infer_class_hierarchy(label)
+        # Perception categories are authoritative object identity hints.  The
+        # ontology only enriches them; an unknown ontology term must not erase
+        # a valid category such as ``fixture`` or ``inspection_zone``.
+        if not specific_class and self.name:
+            specific_class = self.name.strip().lower()
+            parent_classes = [specific_class]
 
         attrs = {
             "color": self.color or "unknown",

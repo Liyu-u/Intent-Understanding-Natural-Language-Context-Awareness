@@ -281,8 +281,10 @@ _ACTION_PATTERNS: List[Tuple[TaskActionKind, re.Pattern[str]]] = [
     (TaskActionKind.PLACE, re.compile(r"放到|放在|摆到|置于|放上|放入|放进|放回|放桌|放托盘|放到.*上|place|put")),
     (TaskActionKind.HANDOVER, re.compile(r"递给|交给|送给|给我|递到我|交到我|递到.*手上|递到.*手里|拿给|handover|hand over|give|deliver")),
     (TaskActionKind.TRANSFER, re.compile(r"转交|移交|传递|转运|转移到|移到|transfer")),
-    (TaskActionKind.FETCH, re.compile(r"拿过来|取过来|拿到我这|帮我拿|把.*拿过来|把.*取过来|把.*抓过来|拿来|抓过来|推过来|fetch|bring")),
-    (TaskActionKind.GRASP, re.compile(r"抓住|抓取|抓紧|拿起|取出|握住|夹住|抓抓|grasp|grab|pick")),
+    # FETCH requires an explicit delivery/deictic cue.  Bare “帮我拿一下” is
+    # a local grasp request and must not fabricate a recipient/delivery pose.
+    (TaskActionKind.FETCH, re.compile(r"拿过来|取过来|拿到我这|送到我这|把.*拿过来|把.*取过来|把.*抓过来|拿来给我|抓过来|推过来|fetch|bring")),
+    (TaskActionKind.GRASP, re.compile(r"抓住|抓取|抓紧|拿起|拿一下|取起|取一下|取出来|取出|握住|夹住|抓抓|grasp|grab|pick")),
 ]
 
 _MANNER_PATTERNS: Dict[str, re.Pattern[str]] = {
@@ -316,8 +318,25 @@ _CN_CATEGORY_ALIASES: Dict[str, List[str]] = {
     "box": ["盒", "盒子", "箱", "hezi"],
     "tray": ["托盘", "盘"],
     "table": ["桌", "桌子", "台", "zhuozi"],
+    "cabinet": ["柜子", "柜", "橱柜"],
+    "book": ["书", "书本"],
     "glass_cup": ["玻璃杯", "杯", "玻璃", "bolibei"],
     "container": ["容器", "杯", "瓶", "盒"],
+    "workpiece": ["工件", "加工件"],
+    "part": ["零件", "部件"],
+    "bearing": ["轴承"],
+    "gear": ["齿轮"],
+    "component": ["组件", "部件"],
+    "inspection_zone": ["检测区", "检验区"],
+    "parts_bin": ["料箱", "零件箱"],
+    "workbench": ["工位", "工作台"],
+    "bin": ["收纳箱", "料箱", "箱"],
+    "welding_zone": ["焊接区"],
+    "fixture": ["夹具"],
+    "hot_surface": ["高温台", "热表面"],
+    "hot_kettle": ["热水壶", "水壶"],
+    "vase": ["花瓶"],
+    "glass": ["玻璃杯", "玻璃物体"],
     "ball": ["球", "小球", "qiu"],
     "block": ["方块", "积木", "块", "jimu"],
     "cube": ["方块", "积木", "方"],
@@ -1284,7 +1303,7 @@ def _extract_numeric_constraints(text: str) -> List[ParsedConstraint]:
 
     # IMPORTANT: MAX/MIN/RANGE before EXACT — otherwise EXACT greedily matches "2N" inside "不超过2N"
     force_patterns = [
-        (ConstraintOperator.MAX, re.compile(r"(?:不超过|最多|至多|<=|小于等于|不大于)\s*(\d+(?:\.\d+)?)\s*(?:N|牛顿)")),
+        (ConstraintOperator.MAX, re.compile(r"(?:(?:劲儿|力|力量|力度|夹持力|抓力)?\s*(?:别|不要|不能)?\s*超过|最多|至多|<=|小于等于|不大于|上限(?:是|为)?|最大(?:是|为)?)\s*(\d+(?:\.\d+)?)\s*(?:N|牛顿)")),
         (ConstraintOperator.MIN, re.compile(r"(?:至少|不低于|>=|大于等于|不小于)\s*(\d+(?:\.\d+)?)\s*(?:N|牛顿)")),
         (ConstraintOperator.RANGE, re.compile(r"(\d+(?:\.\d+)?)\s*(?:到|至|-)\s*(\d+(?:\.\d+)?)\s*(?:N|牛顿)")),
         (ConstraintOperator.EXACT, re.compile(r"(?:用|用力|力度|力量|以)\s*(\d+(?:\.\d+)?)\s*(?:N|牛顿)")),
@@ -1391,7 +1410,7 @@ def _classify_action(text: str) -> TaskActionKind:
     # Priority: transport keywords > manipulation keywords > CUSTOM
     _TRANSPORT_CUES = [
         (TaskActionKind.HANDOVER, re.compile(r"递给|交给|给我|递到|送到.*手上|handover|give|deliver")),
-        (TaskActionKind.FETCH, re.compile(r"拿|取|fetch|bring|拿去|取来|拿来")),
+        (TaskActionKind.FETCH, re.compile(r"拿过来|取过来|拿到我这|拿来给我|fetch|bring")),
         (TaskActionKind.PLACE, re.compile(r"放到|放在|摆到|放入|放进|置于|放上|放回|place|put")),
         (TaskActionKind.TRANSFER, re.compile(r"转移|转运|移交|transfer")),
     ]
@@ -1400,7 +1419,7 @@ def _classify_action(text: str) -> TaskActionKind:
             return action
 
     # Last resort: check for grasp cues
-    if re.search(r"抓|握|夹|grasp|grab|pick", normalized):
+    if re.search(r"抓|拿|取|握|夹|grasp|grab|pick", normalized):
         return TaskActionKind.GRASP
 
     return TaskActionKind.CUSTOM
@@ -1839,9 +1858,12 @@ class GroundingEngine:
         if not candidates:
             return candidates
 
-        spatial_hints = self.config.derive_spatial_hints(instruction)
-        ordinal_hints = self.config.derive_ordinal_hints(instruction)
-        size_hints = self.config.derive_size_hints(instruction)
+        # A synonym table may emit the same normalized cue more than once.
+        # Applying it twice creates artificial confidence and can force an
+        # arbitrary object through an otherwise ambiguous grounding decision.
+        spatial_hints = list(dict.fromkeys(self.config.derive_spatial_hints(instruction)))
+        ordinal_hints = list(dict.fromkeys(self.config.derive_ordinal_hints(instruction)))
+        size_hints = list(dict.fromkeys(self.config.derive_size_hints(instruction)))
 
         if not (spatial_hints or ordinal_hints or size_hints):
             return candidates
@@ -1920,17 +1942,27 @@ class GroundingEngine:
                         c.evidence.append(f"spatial:middle_ambiguous(even_count={n}) -0.10")
 
             elif hint in ("left", "leftmost"):
-                left_id = obj_ids[0] if sp.left_is_lower else obj_ids[-1]
+                values = [getattr(getattr(o, "position", None), axis, 0.0) for o in sorted_objs]
+                extreme = min(values) if sp.left_is_lower else max(values)
+                left_ids = {
+                    getattr(o, "id", "") for o in sorted_objs
+                    if abs(getattr(getattr(o, "position", None), axis, 0.0) - extreme) <= 1e-6
+                }
                 for c in candidates:
-                    if c.entity_ref.entity_id == left_id:
+                    if c.entity_ref.entity_id in left_ids:
                         bonus = 0.35 if hint == "leftmost" else 0.25
                         c.score_components["spatial_match"] = c.score_components.get("spatial_match", 0) + bonus
                         c.evidence.append(f"spatial:{hint} +{bonus:.2f}")
 
             elif hint in ("right", "rightmost"):
-                right_id = obj_ids[-1] if sp.left_is_lower else obj_ids[0]
+                values = [getattr(getattr(o, "position", None), axis, 0.0) for o in sorted_objs]
+                extreme = max(values) if sp.left_is_lower else min(values)
+                right_ids = {
+                    getattr(o, "id", "") for o in sorted_objs
+                    if abs(getattr(getattr(o, "position", None), axis, 0.0) - extreme) <= 1e-6
+                }
                 for c in candidates:
-                    if c.entity_ref.entity_id == right_id:
+                    if c.entity_ref.entity_id in right_ids:
                         bonus = 0.35 if hint == "rightmost" else 0.25
                         c.score_components["spatial_match"] = c.score_components.get("spatial_match", 0) + bonus
                         c.evidence.append(f"spatial:{hint} +{bonus:.2f}")
@@ -2500,7 +2532,9 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
     ast_negated_refs, ast_manner = merge_ast_negations(logical_ast)
 
     # Handle conditional structures
-    if ast_has_conditional(logical_ast):
+    # Pure sequences do not require robot-state evaluation.  The previous
+    # combined note made “A并B” look like an unevaluated IF condition.
+    if logical_ast.conditions or logical_ast.wait_until:
         unsupported = ast_get_unsupported_reason(logical_ast)
         if unsupported:
             notes.append(f"unsupported_conditional:{unsupported}")
@@ -2508,6 +2542,8 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
             # Conditional structure detected but evaluable — pass through
             notes.append(f"conditional_detected:{len(logical_ast.conditions)} conditions, "
                         f"{len(logical_ast.sequences)} sequences")
+    if logical_ast.sequences:
+        notes.append(f"sequence_detected:{len(logical_ast.sequences)} sequences")
 
     # ── Initialize GroundingEngine ──
     engine = GroundingEngine()
@@ -2531,7 +2567,8 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
                  "support_surface": instruction, "obstacle": instruction}
     if action == TaskActionKind.PLACE:
         place_match = re.search(
-            r"把\s*([^，,。；;]+?)\s*(?:放到|放在|放入|置于)\s*"
+            r"(?:把|将|请将|拿起)?\s*([^，,。；;]+?)\s*"
+            r"(?:抓起后|拿起后|并)?\s*(?:放到|放在|放入|放进|放回|摆放在|摆到|置于)\s*"
             r"([^，,。；;]+?)(?:上面|上|里面|里|中)?(?:[，,。；;]|$)",
             normalized,
         )
@@ -2539,9 +2576,12 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
             role_text["theme"] = place_match.group(1).strip()
             role_text["destination"] = place_match.group(2).strip()
             role_text["support_surface"] = place_match.group(2).strip()
-    obstacle_match = re.search(
-        r"(?:别碰|不要碰|不能碰|禁止接触|避开|绕开|绕过|躲开)\s*"
-        r"([^，,。；;]+)", normalized,
+    obstacle_match = (
+        re.search(r"在不接触\s*([^，,。；;]+?)\s*的情况下", normalized)
+        or re.search(
+            r"(?:别碰|不要碰|不能碰|禁止接触|避开|绕开|绕过|躲开|别经过|不要经过|路径别经过|别拿)\s*"
+            r"([^，,。；;]+)", normalized,
+        )
     )
     if obstacle_match:
         role_text["obstacle"] = obstacle_match.group(1).strip()
@@ -2564,16 +2604,20 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
         _exclude_ids: Set[str] = {theme.entity_id} if theme and theme.entity_id else set()
 
         # ── Destination ──
+        # Destination descriptors are role-local. Never apply the theme's
+        # color (e.g. red cup) to a gray tray/table destination.
+        dest_color_hint = engine.config.derive_color_hint(role_text["destination"])
         dest_result = engine.ground(role_text["destination"], scene, role="destination",
-                                     exclude_ids=_exclude_ids, color_hint=_color_hint)
+                                     exclude_ids=_exclude_ids, color_hint=dest_color_hint)
         if dest_result.selected is not None:
             destination = dest_result.selected.entity_ref
             destination.grounding_confidence = min(dest_result.selected.total_score, 1.0)
             _exclude_ids.add(destination.entity_id)
 
         # ── Support surface ──
+        ss_color_hint = engine.config.derive_color_hint(role_text["support_surface"])
         ss_result = engine.ground(role_text["support_surface"], scene, role="support_surface",
-                                   exclude_ids=_exclude_ids, color_hint=_color_hint)
+                                   exclude_ids=_exclude_ids, color_hint=ss_color_hint)
         if ss_result.selected is not None:
             support_surface = ss_result.selected.entity_ref
             support_surface.grounding_confidence = min(ss_result.selected.total_score, 1.0)
@@ -2815,7 +2859,12 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
                          getattr(obj, "specific_class", "") or ""]
                 aliases = _CN_CATEGORY_ALIASES.get(getattr(obj, "specific_class", ""), [])
                 all_names = [n for n in names if n] + aliases
-                if any(neg.target_mention in n or n in neg.target_mention for n in all_names if len(n) >= 1 and len(neg.target_mention) >= 1):
+                attrs = getattr(obj, "attributes", {}) or {}
+                description_match = bool(neg.target_description) and all(
+                    str(attrs.get(k, "")).lower() == str(v).lower()
+                    for k, v in neg.target_description.items()
+                )
+                if description_match or any(neg.target_mention in n or n in neg.target_mention for n in all_names if len(n) >= 1 and len(neg.target_mention) >= 1):
                     grounded = SemanticEntityRef.from_scene_object(obj, role="obstacle",
                         text_span=neg.target_mention)
                     grounded.match_evidence = [f"critical_extractor:{neg.type.value}"]

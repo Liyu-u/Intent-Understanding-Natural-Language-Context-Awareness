@@ -138,8 +138,25 @@ class GroundingConfig:
         "box": ["盒", "盒子", "箱"],
         "tray": ["托盘", "盘"],
         "table": ["桌", "桌子", "台"],
+        "cabinet": ["柜子", "柜", "橱柜"],
+        "book": ["书", "书本"],
         "glass_cup": ["玻璃杯", "杯", "玻璃"],
         "container": ["容器", "杯", "瓶", "盒"],
+        "workpiece": ["工件", "加工件"],
+        "part": ["零件", "部件"],
+        "bearing": ["轴承"],
+        "gear": ["齿轮"],
+        "component": ["组件", "部件"],
+        "inspection_zone": ["检测区", "检验区"],
+        "parts_bin": ["料箱", "零件箱"],
+        "workbench": ["工位", "工作台"],
+        "bin": ["收纳箱", "料箱", "箱"],
+        "welding_zone": ["焊接区"],
+        "fixture": ["夹具"],
+        "hot_surface": ["高温台", "热表面"],
+        "hot_kettle": ["热水壶", "水壶"],
+        "vase": ["花瓶"],
+        "glass": ["玻璃杯", "玻璃物体"],
         "ball": ["球", "小球"],
         "block": ["方块", "积木", "块"],
         "cube": ["方块", "积木", "方"],
@@ -152,9 +169,9 @@ class GroundingConfig:
     # ── Color map ───────────────────────────────────────────
     color_map: Dict[str, str] = field(default_factory=lambda: {
         "红色": "red", "蓝色": "blue", "绿色": "green", "黄色": "yellow",
-        "白色": "white", "黑色": "black", "透明": "transparent",
+        "白色": "white", "黑色": "black", "紫色": "purple", "透明": "transparent",
         "红": "red", "蓝": "blue", "绿": "green", "黄": "yellow",
-        "白": "white", "黑": "black",
+        "白": "white", "黑": "black", "紫": "purple",
     })
 
     # ── Size cue map ────────────────────────────────────────

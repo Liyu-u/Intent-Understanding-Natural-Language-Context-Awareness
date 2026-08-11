@@ -408,5 +408,8 @@ class TestASTIntegration:
     def test_sequence_preserves_notes(self):
         """Sequences should be detected."""
         pt = parse_task_semantics("先抓住杯子再放到桌子上")
-        has_seq = any("conditional_detected" in n for n in pt.notes)
+        # A pure sequence is not an unevaluated condition.  Keep the two
+        # concepts separate so the safety validator does not request robot
+        # state merely because actions are ordered.
+        has_seq = any("sequence_detected" in n for n in pt.notes)
         assert has_seq, f"Sequence should be detected, got: {pt.notes}"

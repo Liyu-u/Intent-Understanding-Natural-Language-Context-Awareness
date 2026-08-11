@@ -125,7 +125,9 @@ def normalize_intent_frame(frame: "IntentFrame") -> Dict[str, Any]:
         return {
             "constraint_id": c.constraint_id,
             "parameter": c.parameter,
-            "operator": c.operator.value,
+            # IntentFrame uses upper-case wire enums (MAX/MIN/...), while the
+            # authoritative ParsedTask contract uses lower-case values.
+            "operator": c.operator.value.lower(),
             "source": "user",
             "source_kind": f"USER_{c.operator.value}",
             "text_span": c.source_text_span,
@@ -795,6 +797,40 @@ class LLMPlanner(TaskPlannerInterface):
             raise LLMPlannerError(
                 "LLM BT dropped obstacle semantics: no Avoid/PlanPath enforcement"
             )
+        if obstacles:
+            obstacle_mentions = {
+                str(o.get("mention") or o.get("specific_class") or "").strip()
+                for o in obstacles if isinstance(o, dict)
+            }
+            obstacle_mentions.discard("")
+            enforcement_found = False
+            for action_node in bt.root.flatten_actions():
+                if action_node.skill_name not in {"Avoid", "PlanPath"}:
+                    continue
+                params = action_node.params or {}
+                raw_targets = (
+                    params.get("avoid_obstacles") or params.get("avoid_objects")
+                    or params.get("avoid") or params.get("obstacles") or []
+                )
+                if isinstance(raw_targets, str):
+                    raw_targets = [raw_targets]
+                enforced_targets = {str(x).strip() for x in raw_targets if str(x).strip()}
+                action_target = str(getattr(action_node, "target", "") or "").strip()
+                if action_target:
+                    enforced_targets.add(action_target)
+                if enforced_targets and (
+                    not obstacle_mentions
+                    or any(
+                        expected in actual or actual in expected
+                        for expected in obstacle_mentions for actual in enforced_targets
+                    )
+                ):
+                    enforcement_found = True
+                    break
+            if not enforcement_found:
+                raise LLMPlannerError(
+                    "LLM BT contains an avoidance skill but does not pass the parsed obstacle to it"
+                )
 
     def _build_bt_node(self, node_json) -> BTNode:
         """递归构建 BTNode (带类型防御)"""

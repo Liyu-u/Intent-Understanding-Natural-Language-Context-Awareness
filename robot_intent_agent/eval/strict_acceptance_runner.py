@@ -21,7 +21,7 @@ from robot_intent_agent.demo.web_ui import Pipeline
 
 
 HERE = Path(__file__).parent
-DATASET = HERE / "strict_acceptance_v1.json"
+DATASET = HERE / "strict_acceptance_v1_1.json"
 
 
 def audit_case(case: dict[str, Any]) -> list[str]:
@@ -64,7 +64,9 @@ def score_output(case: dict[str, Any], r: dict[str, Any]) -> tuple[bool, list[st
     actual_exec = bool(r.get("execution_ready"))
     known_ids = {o["object_id"] for o in case["observation_json"]["objects"]}
 
-    if actual_status != exp["plan_status"]: reasons.append(f"STATUS:{actual_status}!={exp['plan_status']}")
+    accepted_statuses = exp.get("accepted_plan_statuses", [exp["plan_status"]])
+    if actual_status not in accepted_statuses:
+        reasons.append(f"STATUS:{actual_status} not in {accepted_statuses}")
     if actual_exec != exp["execution_allowed"]: reasons.append(f"EXECUTION_ALLOWED:{actual_exec}!={exp['execution_allowed']}")
     action = pt.action.value if pt else None
 
@@ -94,7 +96,11 @@ def score_output(case: dict[str, Any], r: dict[str, Any]) -> tuple[bool, list[st
     skills = list(r.get("actions", []))
     if exp["execution_allowed"]:
         for skill in exp.get("required_skills", []):
-            if skill not in skills: reasons.append(f"MISSING_SKILL:{skill}")
+            # Both skills provide collision-avoidance enforcement.  PlanPath is
+            # the deterministic implementation; an LLM may validly emit Avoid.
+            equivalent = {"PlanPath", "Avoid"} if skill == "PlanPath" else {skill}
+            if not (equivalent & set(skills)):
+                reasons.append(f"MISSING_SKILL:{skill}")
         if r.get("blocking_reasons"): reasons.append("READY_HAS_BLOCKERS")
         if actual_status not in {"READY", "READY_WITH_SAFE_SUBSTITUTION"}: reasons.append("NOT_DISPATCHABLE")
     else:
@@ -106,7 +112,14 @@ def score_output(case: dict[str, Any], r: dict[str, Any]) -> tuple[bool, list[st
     for c in exp.get("constraints", []):
         wanted = (c["parameter"], c["operator"], c["value"], c["unit"])
         if wanted not in constraints: reasons.append(f"MISSING_CONSTRAINT:{wanted}")
-    if exp.get("sequence_required") and not getattr(pt, "sequence", None): reasons.append("MISSING_SEQUENCE")
+    if exp.get("sequence_required"):
+        # ParsedTask has no sequence field. Verify order in the executable BT.
+        required_order = exp.get("required_skill_order", ["Grasp", "Place"])
+        cursor = 0
+        for skill in skills:
+            if cursor < len(required_order) and skill == required_order[cursor]:
+                cursor += 1
+        if cursor != len(required_order): reasons.append(f"MISSING_SEQUENCE:{required_order}")
 
     # Serialization is necessary, never sufficient.
     try: ir.model_dump_json()
@@ -120,8 +133,9 @@ def score_output(case: dict[str, Any], r: dict[str, Any]) -> tuple[bool, list[st
     }
 
 
-def run(mode: str, limit: int | None = None):
-    data = json.loads(DATASET.read_text(encoding="utf-8"))
+def run(mode: str, limit: int | None = None, dataset_path: str | None = None):
+    dataset = Path(dataset_path) if dataset_path else DATASET
+    data = json.loads(dataset.read_text(encoding="utf-8"))
     cases = data["cases"][:limit]
     invalid = {c["case_id"]: audit_case(c) for c in cases if audit_case(c)}
     if invalid:
@@ -154,7 +168,7 @@ def run(mode: str, limit: int | None = None):
         elapsed = (time.time() - t0) * 1000
         latencies.append(elapsed)
         exp = case["expected"]
-        if exp["plan_status"] != "READY" and snapshot.get("status") in {"READY", "READY_WITH_SAFE_SUBSTITUTION"}:
+        if not exp["execution_allowed"] and snapshot.get("status") in {"READY", "READY_WITH_SAFE_SUBSTITUTION"}:
             dangerous_false_allow += 1
         for bucket, key_name in ((by_scene, case["scene"]), (by_difficulty, case["difficulty"]), (by_category, case["category"])):
             bucket[key_name][0] += 1; bucket[key_name][1] += int(passed)
@@ -163,7 +177,7 @@ def run(mode: str, limit: int | None = None):
 
     passed_n = sum(x["passed"] for x in results)
     summary = {
-        "dataset": data["dataset_id"], "dataset_sha256": hashlib.sha256(DATASET.read_bytes()).hexdigest(),
+        "dataset": data["dataset_id"], "dataset_sha256": hashlib.sha256(dataset.read_bytes()).hexdigest(),
         "mode": mode, "total": len(cases), "passed": passed_n, "failed": len(cases)-passed_n,
         "strict_downstream_pass_rate": round(passed_n/len(cases), 4),
         "ability_score_100": round(100*passed_n/len(cases), 2),
@@ -177,7 +191,7 @@ def run(mode: str, limit: int | None = None):
         "by_difficulty": {k: {"total": v[0], "passed": v[1], "rate": round(v[1]/v[0], 4)} for k,v in by_difficulty.items()},
         "by_category": {k: {"total": v[0], "passed": v[1], "rate": round(v[1]/v[0], 4)} for k,v in by_category.items()},
     }
-    out = HERE / f"strict_acceptance_v1_{mode}_results.json"
+    out = HERE / f"{dataset.stem}_{mode}_results.json"
     out.write_text(json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return summary
@@ -187,5 +201,6 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=("rule", "hybrid"), required=True)
     p.add_argument("--limit", type=int)
+    p.add_argument("--dataset")
     args = p.parse_args()
-    run(args.mode, args.limit)
+    run(args.mode, args.limit, args.dataset)

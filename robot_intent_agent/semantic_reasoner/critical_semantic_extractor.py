@@ -149,23 +149,24 @@ class CriticalSemanticExtractor:
     _CONTACT_VERBS_CN = r"碰|触碰|接触|撞|蹭|擦到|靠近|碰到|摸|挨"
     # Action verbs (grasp-related)
     _ACTION_VERBS_CN = r"抓|拿|取|碰|握|夹|端|捏|搬"
+    _TARGET_TOKEN_CN = r"[^，,。；;\s]{1,8}"
 
     NEGATION_PATTERNS = [
         # ── NO_CONTACT: {negation_prefix} + {contact_verb} + target ──
         (NegationType.NO_CONTACT,
-         re.compile(rf"(?:{_NEGATION_PREFIXES_CN})\s*(?:{_CONTACT_VERBS_CN})\s*(\S{{1,8}})")),
+         re.compile(rf"(?:{_NEGATION_PREFIXES_CN})\s*(?:{_CONTACT_VERBS_CN})\s*({_TARGET_TOKEN_CN})")),
         # ── AVOID_ENTITY: {avoidance_prefix} + target ──
         (NegationType.AVOID_ENTITY,
-         re.compile(rf"(?:{_AVOIDANCE_PREFIXES_CN})\s*(\S{{1,8}})")),
+         re.compile(rf"(?:{_AVOIDANCE_PREFIXES_CN})\s*({_TARGET_TOKEN_CN})")),
         # ── FORBID_ACTION: {negation_prefix} + {action_verb} + target ──
         (NegationType.FORBID_ACTION,
-         re.compile(rf"(?:{_NEGATION_PREFIXES_CN})\s*({_ACTION_VERBS_CN})\s*(\S{{1,8}})")),
+         re.compile(rf"(?:{_NEGATION_PREFIXES_CN})\s*({_ACTION_VERBS_CN})\s*({_TARGET_TOKEN_CN})")),
         # ── AVOID_REGION: {negation_prefix} + 靠近/接近 + region ──
         (NegationType.AVOID_REGION,
-         re.compile(rf"(?:{_NEGATION_PREFIXES_CN})\s*(?:靠近|接近|进入)\s*(\S{{1,8}})")),
+         re.compile(rf"(?:{_NEGATION_PREFIXES_CN})\s*(?:靠近|接近|进入)\s*({_TARGET_TOKEN_CN})")),
         # ── GENERIC: bare {negation_prefix} + target (catch-all) ──
         (NegationType.GENERIC_NEGATION,
-         re.compile(rf"(?:{_NEGATION_PREFIXES_CN})\s*(\S{{1,8}})")),
+         re.compile(rf"(?:{_NEGATION_PREFIXES_CN})\s*({_TARGET_TOKEN_CN})")),
         # ── English patterns ──
         (NegationType.NO_CONTACT,
          re.compile(r"(?:don'?t\s+touch|do\s+not\s+touch|never\s+touch|avoid\s+touching)\s+(\S{1,15})", re.IGNORECASE)),
@@ -261,6 +262,12 @@ class CriticalSemanticExtractor:
 
                 # Clean target: strip trailing particles
                 target = re.sub(r"[的了呢吗啊哦]$", "", target.strip())
+
+                # "不要超过3N" is a numeric upper bound, not an obstacle or
+                # prohibition target.  Numeric semantics are extracted by the
+                # dedicated numeric pass below.
+                if re.match(r"超过\s*\d", target):
+                    continue
 
                 if not target or len(target) < 1:
                     continue

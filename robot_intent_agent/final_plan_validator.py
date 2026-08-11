@@ -8,6 +8,7 @@ CONSTRAINT, CAPABILITY, CROSS_FIELD, PROVENANCE, EXECUTABILITY.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from robot_intent_agent.schemas.behavior_tree import BehaviorTree
@@ -73,6 +74,8 @@ class ErrorCode:
     CONDITIONAL_BRANCH_LOST = "CONDITIONAL_BRANCH_LOST"
     CONDITION_STATE_UNKNOWN = "CONDITION_STATE_UNKNOWN"
     COMPOSITE_ACTION_LOST = "COMPOSITE_ACTION_LOST"
+    SELF_CONTRADICTORY_ACTION = "SELF_CONTRADICTORY_ACTION"
+    NUMERIC_CONSTRAINT_CONFLICT = "NUMERIC_CONSTRAINT_CONFLICT"
 
     # Entity references
     ENTITY_ID_NOT_IN_SCENE = "ENTITY_ID_NOT_IN_SCENE"
@@ -142,6 +145,7 @@ class FinalPlanValidator:
         self._validate_numeric_constraints(parsed_task, resolution, issues)
         self._validate_per_skill_velocity(behavior_tree, issues)
         self._validate_force_velocity_bounds(parsed_task, resolution, issues)
+        self._validate_explicit_conflicts(parsed_task, constraint_graph, issues)
         self._validate_dynamic_behavior(parsed_task, behavior_tree, issues)
         self._validate_obstacle_passing(parsed_task, behavior_tree, constraint_graph, issues)
 
@@ -183,6 +187,45 @@ class FinalPlanValidator:
             execution_allowed=execution_allowed,
             issues=issues,
         )
+
+    def _validate_explicit_conflicts(self, parsed_task, constraint_graph, issues):
+        """Fail closed on explicit action and numeric contradictions."""
+        text = parsed_task.instruction or ""
+        if re.search(r"(?:同时|但|又|并且)\s*(?:不要|别|禁止)\s*(?:抓取|抓|拿起|拿|移动|放置)", text):
+            issues.append(_issue(
+                ErrorCategory.SEMANTIC, ErrorCode.SELF_CONTRADICTORY_ACTION,
+                "Instruction simultaneously requests and prohibits the manipulation action.",
+                severity="error", subject="action",
+            ))
+        conflicts = (getattr(constraint_graph, "metadata", {}) or {}).get("conflicts", [])
+        for conflict in conflicts:
+            issues.append(_issue(
+                ErrorCategory.CONSTRAINT, ErrorCode.NUMERIC_CONSTRAINT_CONFLICT,
+                str(conflict), severity="error", subject="constraint",
+            ))
+        # Do not rely solely on the compiled graph: retain a direct semantic
+        # guard so contradictory user bounds can never become executable.
+        by_parameter = {}
+        for constraint in parsed_task.user_constraints:
+            by_parameter.setdefault(constraint.parameter, []).append(constraint)
+        for parameter, constraints in by_parameter.items():
+            lower_bounds = [
+                c.min_value if c.min_value is not None else c.value
+                for c in constraints if c.operator == ConstraintOperator.MIN
+            ]
+            upper_bounds = [
+                c.max_value if c.max_value is not None else c.value
+                for c in constraints if c.operator == ConstraintOperator.MAX
+            ]
+            lower_bounds = [v for v in lower_bounds if v is not None]
+            upper_bounds = [v for v in upper_bounds if v is not None]
+            if lower_bounds and upper_bounds and max(lower_bounds) > min(upper_bounds):
+                issues.append(_issue(
+                    ErrorCategory.CONSTRAINT, ErrorCode.NUMERIC_CONSTRAINT_CONFLICT,
+                    f"Contradictory {parameter} bounds: minimum {max(lower_bounds)} "
+                    f"exceeds maximum {min(upper_bounds)}.",
+                    severity="error", subject=parameter,
+                ))
 
     # ══════════════════════════════════════════════════════════
     # SCHEMA: structural validity
@@ -333,10 +376,14 @@ class FinalPlanValidator:
                 cg_avoids.add(n.params.get("obstacle", ""))
         bt_avoids = set()
         for a in behavior_tree.root.flatten_actions():
+            if a.skill_name in {"Avoid", "PlanPath"} and getattr(a, "target", None):
+                bt_avoids.add(str(a.target))
             for key in ("avoid_obstacles", "avoid", "avoid_objects"):
                 av = a.params.get(key, [])
                 if isinstance(av, list):
                     bt_avoids.update(str(x) for x in av)
+                elif isinstance(av, str) and av:
+                    bt_avoids.add(av)
 
         all_avoids = cg_avoids | bt_avoids | avoid_eids
         for mention in avoid_mentions:
@@ -789,10 +836,14 @@ class FinalPlanValidator:
 
         bt_avoid_params = set()
         for a in behavior_tree.root.flatten_actions():
+            if a.skill_name in {"Avoid", "PlanPath"} and getattr(a, "target", None):
+                bt_avoid_params.add(str(a.target))
             for key in ("avoid_obstacles", "avoid", "avoid_objects"):
                 av = a.params.get(key, [])
                 if isinstance(av, list):
                     bt_avoid_params.update(str(x) for x in av)
+                elif isinstance(av, str) and av:
+                    bt_avoid_params.add(av)
 
         for obs in parsed_task.obstacle:
             obs_id = obs.entity_id or obs.mention

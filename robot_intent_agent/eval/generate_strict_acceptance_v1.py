@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parent
-OUT = ROOT / "strict_acceptance_v1.json"
+OUT = ROOT / "strict_acceptance_v1_1.json"
 
 CATEGORY_COUNTS = {
     "basic_action": 50,
@@ -60,14 +60,25 @@ CLARIFY_COUNTS = {
 
 
 def obj(object_id: str, category: str, color: str, x: float, *, y: float = 0.15, support=False):
+    size_by_category = {
+        "table": (0.80, 0.72, 0.60), "workbench": (1.00, 0.80, 0.70),
+        "inspection_zone": (0.60, 0.04, 0.50), "welding_zone": (0.80, 0.05, 0.80),
+        "tray": (0.35, 0.04, 0.25), "parts_bin": (0.40, 0.25, 0.30),
+        "bin": (0.40, 0.25, 0.30), "cabinet": (0.70, 1.20, 0.45),
+        "fixture": (0.25, 0.15, 0.20), "hot_surface": (0.50, 0.08, 0.40),
+    }
+    width, height, depth = size_by_category.get(category, (0.06, 0.08, 0.06))
+    material = ("glass" if category == "glass" else "metal" if category in {
+        "workpiece", "part", "bearing", "gear", "component", "fixture", "hot_surface"
+    } else "plastic")
     affordances = ["support_surface", "container", "fixed"] if support else ["graspable", "movable"]
     return {
         "object_id": object_id,
         "category_candidates": [{"name": category, "score": 0.98}],
-        "appearance": {"color": color, "material": "plastic"},
+        "appearance": {"color": color, "material": material},
         "pose": {"frame_id": "robot_base", "position": {"x": x, "y": y, "z": 0.05},
                  "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}},
-        "geometry": {"size": {"width": 0.06, "height": 0.08, "depth": 0.06}, "unit": "m"},
+        "geometry": {"size": {"width": width, "height": height, "depth": depth}, "unit": "m"},
         "affordances": affordances,
         "confidence": 0.98,
     }
@@ -143,6 +154,11 @@ def make_case(scene_name: str, category: str, local_i: int, global_i: int):
             instruction = [f"拿起{color_cn}的{target_cn}", f"两个里面请抓{color_cn}{target_cn}",
                            f"选择{color_cn}{target_cn}并拿起来", f"别拿白色的，拿起{color_cn}{target_cn}",
                            f"请取颜色为{color_cn}的{target_cn}"][local_i % 5]
+            # A negatively selected object is still a semantically relevant
+            # exclusion and must be retained for downstream safety planning.
+            if local_i % 5 == 3:
+                expected["obstacle_entity_ids"] = [alt_id]
+                expected["required_skills"] = ["PlanPath", "Reach", "Grasp"]
     elif category == "negation_obstacle" and outcome == "READY":
         instruction = [f"拿起{color_cn}{target_cn}，不要碰到{obs_cn}", f"请避开{obs_cn}抓取{color_cn}{target_cn}",
                        f"在不接触{obs_cn}的情况下拿起{color_cn}{target_cn}", f"抓{color_cn}{target_cn}，路径别经过{obs_cn}",
@@ -175,6 +191,43 @@ def make_case(scene_name: str, category: str, local_i: int, global_i: int):
         expected["obstacle_entity_ids"] = [obstacle_id]
         expected["required_skills"] = ["PlanPath", "Reach", "Grasp"]
 
+    # Preserve the advertised category for clarification/block cases. The v1
+    # generator replaced these with generic missing-target text, contaminating
+    # category scores.
+    if outcome == "NEEDS_CLARIFICATION":
+        if category == "role_binding":
+            instruction = f"把{target_cn}放到{dest_cn}里"
+        elif category == "attribute_spatial":
+            instruction = f"拿起左侧的{target_cn}"
+        elif category == "negation_obstacle":
+            instruction = f"拿起{target_cn}，不要碰到{obs_cn}"
+        elif category == "numeric_constraints":
+            instruction = f"用不超过3N的力拿起{target_cn}"
+        elif category == "condition_sequence":
+            instruction = f"先拿起{target_cn}，然后把它放到{dest_cn}里"
+        elif category == "context_reference":
+            instruction = f"看到{target_cn}了吗？把它拿起来"
+    elif outcome == "BLOCKED":
+        if category == "missing_conflict_safety":
+            # Missing target is safely handled by clarification OR blocking.
+            expected["accepted_plan_statuses"] = ["NEEDS_CLARIFICATION", "BLOCKED"]
+        else:
+            # Create a real semantic conflict with a complete, realistic input.
+            if target_id not in {o["object_id"] for o in objects}:
+                objects.insert(0, obj(target_id, target_cat, color, 0.35))
+            instruction = f"拿起{color_cn}{target_cn}，同时不要抓取{color_cn}{target_cn}"
+            if category == "role_binding":
+                instruction = f"把{color_cn}{target_cn}放到{dest_cn}，同时不要移动{color_cn}{target_cn}"
+            elif category == "negation_obstacle":
+                instruction += f"，并且避开{obs_cn}"
+            elif category == "numeric_constraints":
+                instruction = f"以至少5N且不超过2N的力拿起{color_cn}{target_cn}"
+            elif category == "condition_sequence":
+                instruction = f"先拿起{color_cn}{target_cn}再放到{dest_cn}，同时不要抓取它"
+            expected["accepted_plan_statuses"] = ["BLOCKED"]
+
+    expected.setdefault("accepted_plan_statuses", [outcome])
+
     return {
         "case_id": f"SAV1-{prefix}-{global_i+1:03d}",
         "scene": scene_name,
@@ -190,7 +243,7 @@ def make_case(scene_name: str, category: str, local_i: int, global_i: int):
         },
         "expected": expected,
         "input_contract": {
-            "intentionally_missing_target": outcome == "BLOCKED",
+            "intentionally_missing_target": outcome == "BLOCKED" and category == "missing_conflict_safety",
             "intentional_ambiguity": outcome == "NEEDS_CLARIFICATION",
             "valid_sample": True,
         },
@@ -206,14 +259,14 @@ def generate():
                 cases.append(make_case(scene, category, local_i, global_i))
                 global_i += 1
     payload = {
-        "dataset_id": "strict_acceptance_v1",
+        "dataset_id": "strict_acceptance_v1_1",
         "frozen": True,
         "scoring": "whole-case downstream dispatchability",
         "cases": cases,
     }
     raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
     OUT.write_bytes(raw)
-    (ROOT / "strict_acceptance_v1.sha256").write_text(hashlib.sha256(raw).hexdigest() + "\n", encoding="ascii")
+    (ROOT / "strict_acceptance_v1_1.sha256").write_text(hashlib.sha256(raw).hexdigest() + "\n", encoding="ascii")
     return payload
 
 

@@ -5,7 +5,7 @@ from pathlib import Path
 from robot_intent_agent.eval.strict_acceptance_runner import audit_case
 
 
-DATASET = Path(__file__).parents[1] / "eval" / "strict_acceptance_v1.json"
+DATASET = Path(__file__).parents[1] / "eval" / "strict_acceptance_v1_1.json"
 
 
 def _cases():
@@ -39,3 +39,27 @@ def test_ready_cases_have_dispatch_contract_and_real_perception_ids():
         if expected["destination_entity_id"]:
             assert expected["destination_entity_id"] in known
         assert set(expected["obstacle_entity_ids"]).issubset(known)
+
+
+def test_category_labels_are_present_in_non_ready_language():
+    cues = {
+        "role_binding": ("放到", "放进", "放入", "摆放"),
+        "negation_obstacle": ("不要碰", "避开"),
+        "numeric_constraints": ("N", "牛顿"),
+        "condition_sequence": ("先", "然后", "再"),
+    }
+    for case in _cases():
+        if case["expected"]["plan_status"] == "READY":
+            continue
+        if case["category"] not in cues:
+            continue
+        assert any(cue in case["instruction"] for cue in cues[case["category"]])
+
+
+def test_large_surfaces_have_physically_plausible_dimensions():
+    minimum_width = {"table": 0.5, "workbench": 0.5, "inspection_zone": 0.4}
+    for case in _cases():
+        for obj in case["observation_json"]["objects"]:
+            category = obj["category_candidates"][0]["name"]
+            if category in minimum_width:
+                assert obj["geometry"]["size"]["width"] >= minimum_width[category]
