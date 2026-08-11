@@ -1,0 +1,327 @@
+{
+  "dataset": "open_complex_v1",
+  "interpretation": {
+    "strict_downstream_ready": "Only fully correct, directly consumable JSON passes.",
+    "safe_non_execution": "Ambiguous, conflicting, or unreliable perception must not execute.",
+    "warning": "This benchmark is frozen after the first rule/hybrid measurement and must not become a rule fixture."
+  },
+  "rule": {
+    "mode": "rule",
+    "source_result": "open_complex_v1_rule_results.json",
+    "summary": {
+      "dataset": "open_complex_v1",
+      "dataset_sha256": "b648346361db949f3ba682b2d9d2c624319f157cc3ea86cfae46e842c5973b3b",
+      "mode": "rule",
+      "total": 500,
+      "passed": 256,
+      "failed": 244,
+      "strict_downstream_pass_rate": 0.512,
+      "ability_score_100": 51.2,
+      "dangerous_false_allow": 20,
+      "release_gate_passed": false,
+      "actual_engine_counts": {
+        "RuleEngine": 500
+      },
+      "fallback_count": 0,
+      "latency_ms": {
+        "avg": 9.3,
+        "p50": 8.5,
+        "p95": 12.9
+      },
+      "elapsed_s": 4.7,
+      "by_scene": {
+        "daily": {
+          "total": 250,
+          "passed": 125,
+          "rate": 0.5
+        },
+        "industrial": {
+          "total": 250,
+          "passed": 131,
+          "rate": 0.524
+        }
+      },
+      "by_difficulty": {
+        "medium": {
+          "total": 110,
+          "passed": 100,
+          "rate": 0.9091
+        },
+        "complex": {
+          "total": 390,
+          "passed": 156,
+          "rate": 0.4
+        }
+      },
+      "by_category": {
+        "open_paraphrase": {
+          "total": 60,
+          "passed": 50,
+          "rate": 0.8333
+        },
+        "composite_pick_place": {
+          "total": 60,
+          "passed": 10,
+          "rate": 0.1667
+        },
+        "context_pronoun": {
+          "total": 50,
+          "passed": 40,
+          "rate": 0.8
+        },
+        "negative_contrast": {
+          "total": 50,
+          "passed": 20,
+          "rate": 0.4
+        },
+        "multi_constraint": {
+          "total": 50,
+          "passed": 20,
+          "rate": 0.4
+        },
+        "multi_object_ambiguity": {
+          "total": 50,
+          "passed": 50,
+          "rate": 1.0
+        },
+        "explicit_conflict": {
+          "total": 40,
+          "passed": 20,
+          "rate": 0.5
+        },
+        "conditional_sequence": {
+          "total": 50,
+          "passed": 16,
+          "rate": 0.32
+        },
+        "industrial_role_binding": {
+          "total": 50,
+          "passed": 0,
+          "rate": 0.0
+        },
+        "perception_robustness": {
+          "total": 40,
+          "passed": 30,
+          "rate": 0.75
+        }
+      }
+    },
+    "dimensions": {
+      "action_understanding": {
+        "passed": 288,
+        "total": 370,
+        "rate": 0.7784
+      },
+      "theme_grounding": {
+        "passed": 360,
+        "total": 370,
+        "rate": 0.973
+      },
+      "destination_role": {
+        "passed": 84,
+        "total": 160,
+        "rate": 0.525
+      },
+      "obstacle_negation": {
+        "passed": 107,
+        "total": 150,
+        "rate": 0.7133
+      },
+      "numeric_constraints": {
+        "passed": 60,
+        "total": 100,
+        "rate": 0.6
+      },
+      "sequence_preservation": {
+        "passed": 42,
+        "total": 110,
+        "rate": 0.3818
+      },
+      "safe_non_execution": {
+        "passed": 110,
+        "total": 130,
+        "rate": 0.8462
+      },
+      "strict_downstream_ready": {
+        "passed": 256,
+        "total": 500,
+        "rate": 0.512
+      }
+    },
+    "top_failure_codes": {
+      "MISSING_SKILL": 138,
+      "STATUS": 109,
+      "EXECUTION_ALLOWED": 99,
+      "ACTION": 82,
+      "READY_HAS_BLOCKERS": 79,
+      "NOT_DISPATCHABLE": 79,
+      "DESTINATION_ID": 76,
+      "MISSING_SEQUENCE": 68,
+      "OBSTACLE_IDS": 45,
+      "MISSING_CONSTRAINT": 40,
+      "NON_READY_WITHOUT_REASON": 20,
+      "UNSAFE_EXECUTABLE_NON_READY": 20,
+      "THEME_ID": 10
+    }
+  },
+  "hybrid": {
+    "mode": "hybrid",
+    "source_result": "open_complex_v1_hybrid_results.json",
+    "summary": {
+      "dataset": "open_complex_v1",
+      "dataset_sha256": "b648346361db949f3ba682b2d9d2c624319f157cc3ea86cfae46e842c5973b3b",
+      "mode": "hybrid",
+      "total": 500,
+      "passed": 252,
+      "failed": 248,
+      "strict_downstream_pass_rate": 0.504,
+      "ability_score_100": 50.4,
+      "dangerous_false_allow": 20,
+      "release_gate_passed": false,
+      "actual_engine_counts": {
+        "RuleEngine": 447,
+        "LLMPlanner": 53
+      },
+      "fallback_count": 52,
+      "latency_ms": {
+        "avg": 692.6,
+        "p50": 8.0,
+        "p95": 3593.9
+      },
+      "elapsed_s": 346.3,
+      "by_scene": {
+        "daily": {
+          "total": 250,
+          "passed": 123,
+          "rate": 0.492
+        },
+        "industrial": {
+          "total": 250,
+          "passed": 129,
+          "rate": 0.516
+        }
+      },
+      "by_difficulty": {
+        "medium": {
+          "total": 110,
+          "passed": 100,
+          "rate": 0.9091
+        },
+        "complex": {
+          "total": 390,
+          "passed": 152,
+          "rate": 0.3897
+        }
+      },
+      "by_category": {
+        "open_paraphrase": {
+          "total": 60,
+          "passed": 50,
+          "rate": 0.8333
+        },
+        "composite_pick_place": {
+          "total": 60,
+          "passed": 10,
+          "rate": 0.1667
+        },
+        "context_pronoun": {
+          "total": 50,
+          "passed": 40,
+          "rate": 0.8
+        },
+        "negative_contrast": {
+          "total": 50,
+          "passed": 20,
+          "rate": 0.4
+        },
+        "multi_constraint": {
+          "total": 50,
+          "passed": 16,
+          "rate": 0.32
+        },
+        "multi_object_ambiguity": {
+          "total": 50,
+          "passed": 50,
+          "rate": 1.0
+        },
+        "explicit_conflict": {
+          "total": 40,
+          "passed": 20,
+          "rate": 0.5
+        },
+        "conditional_sequence": {
+          "total": 50,
+          "passed": 16,
+          "rate": 0.32
+        },
+        "industrial_role_binding": {
+          "total": 50,
+          "passed": 0,
+          "rate": 0.0
+        },
+        "perception_robustness": {
+          "total": 40,
+          "passed": 30,
+          "rate": 0.75
+        }
+      }
+    },
+    "dimensions": {
+      "action_understanding": {
+        "passed": 296,
+        "total": 370,
+        "rate": 0.8
+      },
+      "theme_grounding": {
+        "passed": 360,
+        "total": 370,
+        "rate": 0.973
+      },
+      "destination_role": {
+        "passed": 84,
+        "total": 160,
+        "rate": 0.525
+      },
+      "obstacle_negation": {
+        "passed": 107,
+        "total": 150,
+        "rate": 0.7133
+      },
+      "numeric_constraints": {
+        "passed": 56,
+        "total": 100,
+        "rate": 0.56
+      },
+      "sequence_preservation": {
+        "passed": 42,
+        "total": 110,
+        "rate": 0.3818
+      },
+      "safe_non_execution": {
+        "passed": 110,
+        "total": 130,
+        "rate": 0.8462
+      },
+      "strict_downstream_ready": {
+        "passed": 252,
+        "total": 500,
+        "rate": 0.504
+      }
+    },
+    "top_failure_codes": {
+      "MISSING_SKILL": 130,
+      "STATUS": 109,
+      "EXECUTION_ALLOWED": 99,
+      "READY_HAS_BLOCKERS": 79,
+      "NOT_DISPATCHABLE": 79,
+      "DESTINATION_ID": 76,
+      "ACTION": 74,
+      "MISSING_SEQUENCE": 68,
+      "MISSING_CONSTRAINT": 44,
+      "OBSTACLE_IDS": 43,
+      "NON_READY_WITHOUT_REASON": 20,
+      "UNSAFE_EXECUTABLE_NON_READY": 20,
+      "THEME_ID": 10
+    }
+  }
+}
