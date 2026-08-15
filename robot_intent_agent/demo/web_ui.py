@@ -33,11 +33,15 @@ try:
 except Exception:
     PRESET_CASES = {}
 from robot_intent_agent.constraint import HybridConstraintCompiler
+from robot_intent_agent.safety.perception_quality import assess_perception_quality
 from robot_intent_agent.ir import RobotTaskIRGenerator
 from robot_intent_agent.property_inference.property_mapper import PropertyMapper
 from robot_intent_agent.task_semantics import (
-    ParsedTask, ConstraintResolution, ValidationResult, PlanStatus, TaskActionKind,
+    ParsedTask, ConstraintResolution, ValidationResult, ValidationIssue, PlanStatus, TaskActionKind,
 )
+from robot_intent_agent.semantic_compiler import SemanticCompiler
+from robot_intent_agent.intent_output_adapter import build_intent_output
+from robot_intent_agent.schemas.perception_observation import inference_observation
 from robot_intent_agent.schemas.scene import Affordance, SpatialPredicate, SpatialRelation
 
 
@@ -71,6 +75,12 @@ class Pipeline:
         self._llm_err = None
 
     def _get_llm(self, key_override=""):
+        # An explicit empty UI/test value disables the provider.  This keeps
+        # the rule fallback deterministic even when a process environment has
+        # a stale key configured.
+        if key_override is not None and not str(key_override).strip():
+            self._llm_err = "无Key"
+            return None
         k = resolve_deepseek_api_key(key_override)
         if not k:
             self._llm_err = "无Key"; return None
@@ -98,7 +108,17 @@ class Pipeline:
         obs_data = json.loads(obs_json_str.strip())
         if isinstance(obs_data, list):
             if len(obs_data) > 0 and isinstance(obs_data[0], dict): obs_data = obs_data[0]
+        # Evaluation truth is never part of the inference observation.  Keep
+        # the public input shape, but strip simulation-only truth before any
+        # scene construction, semantic compilation, or provider call.
+        obs_data = inference_observation(obs_data if isinstance(obs_data, dict) else {})
         objects_raw = obs_data.get("objects", []) if isinstance(obs_data, dict) else []
+        # Perception is assumed correct for intent evaluation.  Only the
+        # structural/schema gate belongs in this main pipeline; confidence
+        # degradation is evaluated by a separate test family.
+        perception_quality = assess_perception_quality(
+            obs_data if isinstance(obs_data, dict) else {}, mode="schema"
+        )
 
         scene_objects, all_sem_props = [], []
         for obj_data in objects_raw:
@@ -144,18 +164,33 @@ class Pipeline:
             upstream_affordances = set(obj_data.get("affordances", []) or [])
             if grounding_cat["name"] in {"tray", "table", "workbench", "platform", "bin"}:
                 affs.append(Affordance.FIXED)
+                # FETCH destinations are physical receive/support surfaces;
+                # preserve the upstream affordance instead of reducing them
+                # to only ``fixed`` during perception adaptation.
+                if grounding_cat["name"] in {"tray", "bin"}:
+                    affs.append(Affordance.CONTAINER)
             if "fixed" in upstream_affordances or "support_surface" in upstream_affordances:
                 affs.append(Affordance.FIXED)
             if "container" in upstream_affordances:
                 affs.append(Affordance.CONTAINER)
+            # Keep recipient/receive-zone affordances in the scene as
+            # deterministic grounding evidence. The enum is intentionally
+            # small, so these remain upstream metadata rather than invented
+            # execution skills.
             affs = list(dict.fromkeys(affs))
-            raw = RawObjectPercept(name=grounding_cat["name"], x=px, y=py, z=pz, width=w, height=h, depth=d,
-                                   color=color_val, material=sp.material.value,
+            surface_alias = {
+                "cup": "杯子", "tray": "托盘", "box": "盒子", "table": "桌子",
+                "bottle": "瓶子", "medicine_bottle": "药瓶", "ball": "小球",
+            }.get(grounding_cat["name"], grounding_cat["name"])
+            raw = RawObjectPercept(name=surface_alias, x=px, y=py, z=pz, width=w, height=h, depth=d,
+                                   color=color_val, material=material_from_json or sp.material.value,
                                    object_id=obj_id,
                                    extra_attrs={"_orig_object_id": obj_id,
                                                 "_category_candidates": candidates,
+                                                "_upstream_affordances": sorted(upstream_affordances),
                                                 "_speed_mps": vel_mag,
-                                                "_is_moving": is_moving, "_vel_conf": vel_conf})
+                                                "_is_moving": is_moving, "_vel_conf": vel_conf,
+                                                "_perception_category": grounding_cat["name"]})
             raw._affs = affs; scene_objects.append(raw)
 
         orig = RawObjectPercept.to_scene_object
@@ -198,7 +233,15 @@ class Pipeline:
                 existing_relations.add(key)
 
         target = all_sem_props[0].category if all_sem_props else "target"
-        planner_name = "RuleEngine"
+        planner_name = "RuleSemanticCompiler"
+        requested_engine = engine
+        # Keep the old UI branch below temporarily for compatibility with
+        # historical labels, but make its result non-authoritative.  The
+        # compiler invocation immediately before constraint compilation is
+        # the only production result used downstream.
+        engine = "__semantic_compiler__"
+        if False:
+            """
         if engine in ("纯规则引擎 (极速)",):
             bt = self.rule_planner.plan(instruction, scene=scene)
         elif engine in ("DeepSeek-V3 (AI 推理)", "Hybrid (混合优先)"):
@@ -215,18 +258,67 @@ class Pipeline:
                     planner_name = "RuleEngine(Hybrid失败)"
             else:
                 try:
-                    bt = llm.plan(instruction, scene=scene)
-                    planner_name = "DeepSeek-V3"
+                    llm_bt = llm.plan(instruction, scene=scene)
+                    # LLM supplies semantic metadata only; executable skills
+                    # are rebuilt by the deterministic rule planner.
+                    bt = self.rule_planner.plan(instruction, scene=scene)
+                    if isinstance(llm_bt.metadata, dict) and isinstance(llm_bt.metadata.get("parsed_task"), dict):
+                        bt.metadata["parsed_task"] = llm_bt.metadata["parsed_task"]
+                        bt.metadata["semantic_frame_version"] = llm_bt.metadata.get("semantic_frame_version", "legacy")
+                        bt.metadata["llm_semantics_attached"] = True
+                        bt.metadata["llm_bt_discarded"] = True
+                    planner_name = "DeepSeek-semantics→RuleBT"
                 except Exception:
                     bt = self.rule_planner.plan(instruction, scene=scene)
                     planner_name = "RuleEngine(DS失败)"
-        else:
+        elif False:
             bt = self.rule_planner.plan(instruction, scene=scene)
+            """
 
+        compiler_mode = "rule"
+        llm_for_compile = None
+        if any(token in str(requested_engine) for token in ("DeepSeek", "Hybrid", "LLM", "AI")):
+            llm_for_compile = self._get_llm(api_key)
+            if llm_for_compile is not None:
+                compiler_mode = "hybrid" if "Hybrid" in str(requested_engine) else "llm"
+        # The provider selected above is intentionally reused by the one
+        # authoritative compiler invocation below.
+        if requested_engine in ("DeepSeek-V3 (AI 鎺ㄧ悊)", "Hybrid (娣峰悎浼樺厛)"):
+            llm_for_compile = self._get_llm(api_key)
+            if llm_for_compile is not None:
+                compiler_mode = "hybrid" if requested_engine == "Hybrid (娣峰悎浼樺厛)" else "llm"
+        if llm_for_compile is None and any(token in str(requested_engine) for token in ("DeepSeek", "Hybrid", "LLM", "AI")):
+            llm_for_compile = self._get_llm(api_key)
+            if llm_for_compile is not None:
+                compiler_mode = "hybrid" if "Hybrid" in str(requested_engine) else "llm"
+        compiled = SemanticCompiler(llm_for_compile).compile(
+            instruction, scene=scene, mode=compiler_mode
+        )
+        bt = compiled.behavior_tree
+        if compiled.engine_trace.get("fallback_used"):
+            planner_name = "RuleEngine(LLM降级)"
+        elif compiled.llm_candidates:
+            planner_name = "HybridSemanticCompiler"
+        else:
+            planner_name = "RuleEngine"
         cg = self.compiler.compile(instruction, behavior_tree=bt, scene=scene, target=target)
         ir = self.generator.generate(instruction, behavior_tree=bt, constraint_graph=cg, scene=scene)
         parsed_task = ir.parsed_task; resolution = ir.constraint_resolution
         validation_result = ir.validation_result; plan_metadata = ir.plan_metadata
+        if perception_quality["status"] != "READY":
+            for reason in perception_quality["issues"]:
+                validation_result.issues.append(ValidationIssue(
+                    code="PERCEPTION_QUALITY_GATE",
+                    message=reason,
+                    severity="error",
+                    subject="perception",
+                ))
+            validation_result.execution_allowed = False
+            forced_status = (PlanStatus.BLOCKED if perception_quality["status"] == "BLOCKED"
+                             else PlanStatus.NEEDS_CLARIFICATION)
+            validation_result.status = forced_status
+            plan_metadata.plan_status = forced_status
+            resolution.plan_status = forced_status
 
         action = parsed_task.action.value if parsed_task else bt.metadata.get("action", "?")
         avoid_objs = [obj.mention for obj in parsed_task.obstacle] if parsed_task else []
@@ -237,8 +329,10 @@ class Pipeline:
         raw_requested_force = raw_requested_vel = None
         if parsed_task:
             for constraint in parsed_task.user_constraints:
-                if constraint.parameter == "force_n" and constraint.value is not None: raw_requested_force = constraint.value
-                if constraint.parameter == "velocity_ms" and constraint.value is not None: raw_requested_vel = constraint.value
+                if constraint.parameter == "force_n" and constraint.value is not None and raw_requested_force is None:
+                    raw_requested_force = constraint.value
+                if constraint.parameter == "velocity_ms" and constraint.value is not None and raw_requested_vel is None:
+                    raw_requested_vel = constraint.value
 
         final_force = resolution.parameters.get("force_n").selected_value if resolution and resolution.parameters.get("force_n") else None
         final_velocity = resolution.parameters.get("velocity_ms").selected_value if resolution and resolution.parameters.get("velocity_ms") else None
@@ -285,6 +379,23 @@ class Pipeline:
             else:
                 execution_ready = True
 
+        intent_output = build_intent_output(
+            ir,
+            observation=obs_data,
+            observation_id=obs_data.get("observation_id"),
+            scene_id=obs_data.get("scene_id"),
+            status_override=plan_status,
+            execution_allowed_override=execution_ready,
+            intent_id_override=obs_data.get("request_id") or obs_data.get("observation_id"),
+        )
+        ir.intent_output = intent_output.model_dump(mode="json")
+        # Keep the legacy view-model status lossless for existing UI/evaluator
+        # consumers.  The public flat contract intentionally normalizes
+        # READY_WITH_SAFE_SUBSTITUTION to READY; the selected safe value and
+        # override ledger remain available in IR/constraints.
+        plan_status = plan_metadata.plan_status.value if plan_metadata else intent_output.plan_status
+        execution_ready = intent_output.execution_allowed
+
         elapsed = round((time.time() - st) * 1000)
         hard_count = len(cg.hard_constraints()); soft_count = len(cg.soft_constraints())
         trace_nodes = json.loads(ir.model_dump_json()).get("decision_trace", []) if ir else []
@@ -297,7 +408,9 @@ class Pipeline:
                 "validation_result": validation_result, "override": override, "hard": hard_count, "soft": soft_count,
                 "actions": [a.skill_name for a in bt.root.flatten_actions()] if bt else [],
                 "trace": trace_nodes, "ir_raw": ir.model_dump_json(indent=2) if ir else "",
-                "planner_name": planner_name}
+                "intent_output": intent_output.model_dump(mode="json"),
+                "intent_output_raw": intent_output.model_dump_json(indent=2),
+                "planner_name": planner_name, "perception_quality": perception_quality}
 
 pipeline = Pipeline()
 

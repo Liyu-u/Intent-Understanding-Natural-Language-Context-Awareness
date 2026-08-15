@@ -92,6 +92,10 @@ class TestRobotTaskIRGenerator:
             memory_context=memory_items,
         )
         assert isinstance(ir, RobotTaskIR)
+        assert ir.output_contract["complete"] is True
+        assert ir.output_contract["serializable"] is True
+        assert ir.output_contract["top_level_field_count"] >= 20
+        assert "validation_result" in ir.output_contract["present_sections"]
 
     def test_ir_has_metadata(
         self, generator, behavior_tree, constraint_graph, scene, memory_items

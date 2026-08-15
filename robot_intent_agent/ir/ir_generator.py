@@ -9,6 +9,7 @@ Robot Task IR Generator — 统一中间表示编译器
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -52,6 +53,7 @@ from robot_intent_agent.task_semantics import (
     RobotCapabilityValidator,
     CapabilityDecision,
 )
+from robot_intent_agent.safety.action_conflict_checker import find_action_constraint_conflicts
 from robot_intent_agent.final_plan_validator import FinalPlanValidator
 
 
@@ -108,6 +110,45 @@ class RobotTaskIRGenerator:
             resolution=constraint_resolution,
         )
 
+        # The grounded task is the authoritative result of role completion.
+        # FinalPlanValidator historically checked the parsed task directly,
+        # which allowed a late projection to lose a missing role and still
+        # leave the plan READY.  Carry every unresolved role/clarification
+        # into the final safety gate before any public JSON is built.
+        grounded_blockers = list(grounded_task.missing_roles or []) + list(
+            grounded_task.required_clarifications or []
+        )
+        if grounded_blockers:
+            for blocker in grounded_blockers:
+                validation_result.issues.append(ValidationIssue(
+                    code="GROUNDING_INCOMPLETE",
+                    message=str(blocker),
+                    severity="error",
+                    subject="semantic_grounding",
+                ))
+            validation_result.execution_allowed = False
+            validation_result.status = PlanStatus.NEEDS_CLARIFICATION
+            constraint_resolution.plan_status = PlanStatus.NEEDS_CLARIFICATION
+
+        # Final deterministic safety gate.  This runs after parsing/grounding
+        # and before the plan can be marked executable, regardless of planner.
+        semantic_authority = behavior_tree.metadata.get("semantic_authority") == "SemanticCompiler"
+        conflict_reasons = find_action_constraint_conflicts(
+            parsed_task, instruction, scene=scene,
+            semantic_authority=semantic_authority,
+        )
+        if conflict_reasons:
+            for reason in conflict_reasons:
+                validation_result.issues.append(ValidationIssue(
+                    code="ACTION_CONSTRAINT_CONFLICT",
+                    message=reason,
+                    severity="error",
+                    subject="action_constraints",
+                ))
+            validation_result.execution_allowed = False
+            validation_result.status = PlanStatus.BLOCKED
+            constraint_resolution.plan_status = PlanStatus.BLOCKED
+
         # ── Robot capability validation ──
         robot_cap = RobotCapability()
         robot_validator = RobotCapabilityValidator(robot_cap)
@@ -130,6 +171,12 @@ class RobotTaskIRGenerator:
             validation_result.status = PlanStatus.BLOCKED
             # Also update plan_metadata to stay consistent
             constraint_resolution.plan_status = PlanStatus.BLOCKED
+
+        # Single source of truth for dispatch consistency.
+        if validation_result.status in (PlanStatus.BLOCKED, PlanStatus.NEEDS_CLARIFICATION):
+            validation_result.execution_allowed = False
+        if not validation_result.execution_allowed:
+            constraint_resolution.plan_status = validation_result.status
 
         # ── 1. 元数据 ──
         metadata = TaskMetadata(
@@ -207,9 +254,162 @@ class RobotTaskIRGenerator:
             explain_report=explain_report,
             risk_objects=risk_objects,
             semantic_enforcement_trace=enforcement_trace,
+            semantic_task_graph=parsed_task.semantic_task_graph or behavior_tree.metadata.get("semantic_task_graph", {}),
+            grounding_decisions=list(parsed_task.grounding_decisions or []),
+            ambiguity_resolution=list(parsed_task.ambiguity_resolution or []),
+            fusion_trace=list(parsed_task.fusion_trace or behavior_tree.metadata.get("fusion_trace", []) or []),
         )
 
+        # Make the downstream JSON contract explicit and auditable.  The
+        # contract is generated after all deterministic stages, so it measures
+        # the actual object sent to policy generation rather than the raw LLM
+        # response.
+        engine_trace = behavior_tree.metadata.get("engine_trace", {}) if isinstance(behavior_tree.metadata, dict) else {}
+        if isinstance(behavior_tree.metadata, dict) and behavior_tree.metadata.get("semantic_authority") == "SemanticCompiler":
+            ir.semantic_enforcement_trace["semantic_authority"] = "SemanticCompiler"
+            ir.semantic_enforcement_trace["graph_to_parsed_task"] = "one_way_projection"
+            ir.semantic_enforcement_trace["instruction_reparse_forbidden"] = True
+        ir.semantic_enforcement_trace["llm_fusion"] = engine_trace.get("llm_fusion", {
+            "baseline": "rule_engine",
+            "accepted_fields": [],
+            "protected_fields": ["entity_id", "user_constraints", "obstacle", "prohibitions"],
+            "final_authority": "deterministic_grounding_and_validation",
+        })
+        ir.grounding_decisions = self._build_grounding_decisions(parsed_task, scene)
+        ir.ambiguity_resolution = self._build_ambiguity_resolution(parsed_task)
+        ir.execution_contract = self._build_execution_contract(ir)
+        ir.output_contract = self._build_output_contract(ir)
+        if not ir.output_contract.get("complete") or not ir.output_contract.get("serializable"):
+            validation_result.execution_allowed = False
+            validation_result.status = PlanStatus.BLOCKED
+            constraint_resolution.plan_status = PlanStatus.BLOCKED
+            ir.plan_metadata.plan_status = PlanStatus.BLOCKED
+            ir.semantic_enforcement_trace["output_contract_blocked"] = True
+
+        # Final single-source-of-truth synchronization.  Several downstream
+        # consumers read different sections of the JSON; leaving one stale
+        # after a late safety/contract decision creates an unsafe or unusable
+        # plan even when the validator itself is correct.
+        final_status = validation_result.status
+        dispatchable = final_status in (PlanStatus.READY, PlanStatus.READY_WITH_SAFE_SUBSTITUTION)
+        validation_result.execution_allowed = bool(
+            validation_result.execution_allowed and dispatchable
+        )
+        constraint_resolution.plan_status = final_status
+        ir.plan_metadata.plan_status = final_status
+        ir.plan_metadata.execution_readiness = 1.0 if validation_result.execution_allowed else 0.0
+        ir.plan_metadata.execution_allowed = bool(validation_result.execution_allowed)
+        ir.plan_metadata.plan_feasibility_confidence = (
+            1.0 if validation_result.execution_allowed else 0.0
+        )
+        ir.semantic_enforcement_trace["final_decision"] = {
+            "status": final_status.value,
+            "execution_allowed": validation_result.execution_allowed,
+            "authority": "FinalPlanValidator + deterministic safety gate",
+        }
+        ir.execution_contract = self._build_execution_contract(ir)
+        # Populate the stable external contract from the already validated IR.
+        # This is a one-way projection; the adapter never re-parses language.
+        from robot_intent_agent.intent_output_adapter import build_intent_output
+        ir.intent_output = build_intent_output(ir).model_dump(mode="json")
+
         return ir
+
+    @staticmethod
+    def _build_grounding_decisions(parsed_task: ParsedTask, scene=None) -> List[Dict[str, Any]]:
+        decisions = []
+        for role, entity in parsed_task.role_map().items():
+            if entity is None:
+                continue
+            candidates = [entity.entity_id] if entity.entity_id else []
+            decisions.append({
+                "role": role,
+                "selected_entity_id": entity.entity_id,
+                "candidate_ids": candidates,
+                "evidence": list(entity.match_evidence or []) + ([f"mention={entity.mention}"] if entity.mention else []),
+                "margin": entity.grounding_confidence,
+                "decision": "RESOLVED" if entity.entity_id else "NEEDS_CLARIFICATION",
+            })
+        for entity in parsed_task.obstacle or []:
+            decisions.append({
+                "role": "obstacle", "selected_entity_id": entity.entity_id,
+                "candidate_ids": [entity.entity_id] if entity.entity_id else [],
+                "evidence": list(entity.match_evidence or []),
+                "margin": entity.grounding_confidence,
+                "decision": "RESOLVED" if entity.entity_id else "NEEDS_CLARIFICATION",
+            })
+        return decisions
+
+    @staticmethod
+    def _build_ambiguity_resolution(parsed_task: ParsedTask) -> List[Dict[str, Any]]:
+        return [
+            {"type": note.split(":", 2)[1], "status": "NEEDS_CLARIFICATION", "evidence": note}
+            for note in (parsed_task.notes or []) if str(note).startswith("ambiguity:")
+        ]
+
+    @staticmethod
+    def _build_execution_contract(ir: RobotTaskIR) -> Dict[str, Any]:
+        issues = ir.validation_result.issues if ir.validation_result else []
+        codes = {issue.code for issue in issues}
+        return {
+            "schema_complete": not any("SCHEMA" in code or "ACTION_SCHEMA" in code for code in codes),
+            "entity_ids_verified": not any("ENTITY" in code or "GROUNDING" in code for code in codes),
+            "roles_complete": not any("MISSING" in code or "ROLE" in code for code in codes),
+            "constraints_resolved": not any("CONSTRAINT" in code for code in codes)
+                and all(not resolution.domain.is_empty() for resolution in (ir.constraint_resolution.parameters.values() if ir.constraint_resolution else [])),
+            "behavior_tree_consistent": not any("BT_" in code or "BEHAVIOR" in code for code in codes),
+            "execution_allowed": bool(ir.validation_result and ir.validation_result.execution_allowed),
+        }
+
+    @staticmethod
+    def _build_output_contract(ir: RobotTaskIR) -> Dict[str, Any]:
+        """Describe whether the final IR is complete and JSON-safe.
+
+        Missing semantic information is represented by null/[] and reflected
+        in validation status; the serializer itself must still expose every
+        stable top-level section for downstream consumers.
+        """
+        required_sections = [
+            "ir_version", "task_metadata", "parsed_task", "grounded_task",
+            "task_intent", "constraint_resolution", "validation_result",
+            "plan_metadata", "behavior_tree", "skills", "compiled_constraints",
+            "optimization_space", "semantic_enforcement_trace",
+            "semantic_task_graph", "grounding_decisions", "ambiguity_resolution",
+            "fusion_trace", "execution_contract", "intent_output",
+        ]
+        payload = ir.model_dump(mode="json")
+        present_sections = [name for name in required_sections if payload.get(name) is not None]
+
+        def count_fields(value: Any) -> int:
+            if isinstance(value, dict):
+                return len(value) + sum(count_fields(v) for v in value.values())
+            if isinstance(value, list):
+                return sum(count_fields(v) for v in value)
+            return 0
+
+        serializable = True
+        serialization_error = ""
+        try:
+            json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            serializable = False
+            serialization_error = str(exc)
+
+        trace = ir.semantic_enforcement_trace.get("llm_fusion", {})
+        return {
+            "contract_version": "downstream-json-1.1",
+            "complete": len(present_sections) == len(required_sections),
+            "serializable": serializable,
+            "serialization_error": serialization_error,
+            "required_sections": required_sections,
+            "present_sections": present_sections,
+            "missing_sections": [name for name in required_sections if name not in present_sections],
+            "top_level_field_count": len(payload),
+            "recursive_field_count": count_fields(payload),
+            "llm_contribution": trace.get("accepted_fields", []),
+            "safety_authority": "deterministic",
+            "execution_authority": "deterministic_validator",
+        }
 
     # ============================================================
     # Skills — 核心: BT Action + Constraint 绑定
@@ -319,6 +519,11 @@ class RobotTaskIRGenerator:
                         "affordances": [a.value for a in obj.affordances],
                         "attributes": obj.attributes,
                     }
+            if object_info is None:
+                # Preserve the fact that this skill has no scene-resolvable
+                # physical object (condition/user/symbolic role) without
+                # fabricating a scene object.
+                object_info = {"unresolved_role": target or skill_name}
 
             # P1-3: 全局兜底 + 值同步
             wrapped_params = self._wrap_all_params(action.params, skill_name)
@@ -349,7 +554,7 @@ class RobotTaskIRGenerator:
                 result["force_n"]["value"] = force_value
                 result["force_n"]["source"] = [resolution.parameters["force_n"].selected_source_kind.value if resolution.parameters.get("force_n") and resolution.parameters["force_n"].selected_source_kind else "resolution"]
                 result["force_n"]["evidence"] = [f"resolution:{force_value}"]
-        if velocity_value is not None and skill_name in ("Reach", "MoveTo", "Push"):
+        if velocity_value is not None and skill_name in ("Reach", "MoveTo", "Transport", "Push"):
             if "velocity_ms" in result and isinstance(result["velocity_ms"], dict):
                 result["velocity_ms"]["value"] = velocity_value
                 result["velocity_ms"]["source"] = [resolution.parameters["velocity_ms"].selected_source_kind.value if resolution.parameters.get("velocity_ms") and resolution.parameters["velocity_ms"].selected_source_kind else "resolution"]
@@ -448,7 +653,7 @@ class RobotTaskIRGenerator:
             compiled["fragile"] = final_val <= 3.0
 
         # ── velocity_ms → ParamValue ──
-        if skill_name in ("Reach", "MoveTo", "Push"):
+        if skill_name in ("Reach", "MoveTo", "Transport", "Push"):
             final_v = vel_res.selected_value if vel_res and vel_res.selected_value is not None else float(params.get("velocity_ms", 0) or 0.15)
 
             sources_v = [vel_res.selected_source_kind.value] if vel_res and vel_res.selected_source_kind else ["resolution"]

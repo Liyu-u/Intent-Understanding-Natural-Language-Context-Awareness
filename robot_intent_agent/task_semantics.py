@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -26,6 +27,10 @@ class TaskActionKind(str, Enum):
     HANDOVER = "HANDOVER"
     TRANSFER = "TRANSFER"
     DYNAMIC_GRASP = "DYNAMIC_GRASP"
+    WAIT = "WAIT"
+    PUSH = "PUSH"
+    STACK = "STACK"
+    POUR = "POUR"
     CUSTOM = "CUSTOM"
 
 
@@ -235,6 +240,19 @@ class ParsedTask(BaseModel):
     grounding_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     constraint_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     notes: List[str] = Field(default_factory=list)
+    clarification: Optional[str] = Field(default=None)
+    steps: List[Dict[str, Any]] = Field(default_factory=list)
+    # Preserved from IntentFrame so LLM condition/branch semantics survive
+    # the deterministic grounding boundary instead of being reduced to notes.
+    conditions: List[Dict[str, Any]] = Field(default_factory=list)
+    prohibitions: List[Dict[str, Any]] = Field(default_factory=list)
+    # New semantic-compiler boundary.  These fields are optional so the
+    # legacy public model and persisted regression fixtures remain compatible.
+    semantic_task_graph: Optional[Dict[str, Any]] = Field(default=None)
+    grounding_decisions: List[Dict[str, Any]] = Field(default_factory=list)
+    ambiguity_resolution: List[Dict[str, Any]] = Field(default_factory=list)
+    fusion_trace: List[Dict[str, Any]] = Field(default_factory=list)
+    execution_contract: Dict[str, Any] = Field(default_factory=dict)
 
     def role_map(self) -> Dict[str, Optional[SemanticEntityRef]]:
         return {
@@ -280,7 +298,7 @@ _ACTION_PATTERNS: List[Tuple[TaskActionKind, re.Pattern[str]]] = [
     (TaskActionKind.DYNAMIC_GRASP, re.compile(r"正在移动|移动中的|动态抓|动态取|追踪.*抓|抓住正在移动")),
     (TaskActionKind.PLACE, re.compile(r"放到|放在|摆到|置于|放上|放入|放进|放回|放桌|放托盘|放到.*上|place|put")),
     (TaskActionKind.HANDOVER, re.compile(r"递给|交给|送给|给我|递到我|交到我|递到.*手上|递到.*手里|拿给|handover|hand over|give|deliver")),
-    (TaskActionKind.TRANSFER, re.compile(r"转交|移交|传递|转运|转移到|移到|transfer")),
+    (TaskActionKind.TRANSFER, re.compile(r"上料到|上料|搬运到|送到|运到|转交|移交|传递|转运|转移到|移到|transfer")),
     # FETCH requires an explicit delivery/deictic cue.  Bare “帮我拿一下” is
     # a local grasp request and must not fabricate a recipient/delivery pose.
     (TaskActionKind.FETCH, re.compile(r"拿过来|取过来|拿到我这|送到我这|把.*拿过来|把.*取过来|把.*抓过来|拿来给我|抓过来|推过来|fetch|bring")),
@@ -345,6 +363,17 @@ _CN_CATEGORY_ALIASES: Dict[str, List[str]] = {
     "rubber": ["橡胶", "xiangjiao"],
     "metal": ["金属", "铁", "tie", "jinshu"],
 }
+
+# Open-language aliases used by the blind/generalization set. Keep these as
+# semantic evidence only; IDs still come exclusively from the scene.
+_CN_CATEGORY_ALIASES["cup"].extend(["cup", "beizi", "verre"])
+_CN_CATEGORY_ALIASES["glass_cup"].extend(["cup", "beizi", "verre"])
+_CN_CATEGORY_ALIASES["bottle"].extend(["bottle", "bouteille"])
+# Keep the material-specific mention exclusive.  If generic ``cup`` also
+# matches ``玻璃杯``, glass and plastic cups become indistinguishable before
+# material scoring can help.
+if "玻璃杯" in _CN_CATEGORY_ALIASES["cup"]:
+    _CN_CATEGORY_ALIASES["cup"].remove("玻璃杯")
 
 # ── Spatial / size / motion cues for grounding ──────────────────
 
@@ -891,7 +920,8 @@ class RobotCapability:
     supported_skills: List[str] = field(default_factory=lambda: [
         "Reach", "Grasp", "GentleGrasp", "MoveTo", "Release",
         "Fetch", "Place", "Handover", "DynamicGrasp", "WaitUntilStable",
-        "PlanPath", "Avoid", "Push", "Stack", "Pour", "Transfer",
+        "PlanPath", "Avoid", "Push", "Stack", "Pour", "Transfer", "Transport",
+        "MoveToHandoverZone", "WaitUntil",
     ])
     unavailable_skills: List[str] = field(default_factory=list)
 
@@ -1400,6 +1430,8 @@ def _extract_manner(text: str) -> Optional[str]:
 
 def _classify_action(text: str) -> TaskActionKind:
     normalized = _normalize_text(text)
+    if re.search(r"(?:翻转|旋转|转过来|翻过来|rotate|flip)", normalized) and re.search(r"(?:抓|拿|夹|握|grasp|grab|pick)", normalized.lower()):
+        return TaskActionKind.CUSTOM
     for action, pattern in _ACTION_PATTERNS:
         if pattern.search(normalized):
             return action
@@ -1551,6 +1583,17 @@ def _extract_obstacles(text: str, scene: Any = None, target: Optional[SemanticEn
                             _append(SemanticEntityRef.from_scene_object(blocker, role="obstacle",
                                 text_span=getattr(blocker, "name", "")))
 
+        # Relational contrast: “前面的杯子，不要后面的” or the inverse.
+        # Use the same-category peer group and exclude the selected theme.
+        if re.search(r"(?:不要|别|勿).{0,8}(?:后面的|前面的|左边的|右边的)", normalized):
+            for obj in getattr(scene, "objects", []) or []:
+                if target and getattr(obj, "id", None) == target.entity_id:
+                    continue
+                aliases = _CN_CATEGORY_ALIASES.get(getattr(obj, "specific_class", ""), [])
+                if any(alias in normalized for alias in aliases):
+                    _append(SemanticEntityRef.from_scene_object(
+                        obj, role="obstacle", text_span="relative_peer"))
+
     # Fallback: NL-only obstacle when no scene grounding succeeded
     if not obstacles and has_caution:
         # Try to extract obstacle mention from the text near caution tokens
@@ -1673,9 +1716,128 @@ class GroundingEngine:
         # ── Phase 4: Re-rank by total score ──
         candidates.sort(key=lambda c: c.total_score, reverse=True)
 
+        # Explicit relational/ordinal/size descriptors are deterministic
+        # selectors inside the eligible peer group.  Do not let the generic
+        # margin gate turn an explicit "left/high/small" reference into a
+        # clarification merely because the raw language scores are close.
+        explicit = self._select_explicit_descriptor(candidates, instruction, scene)
+        if explicit is not None:
+            candidates = [explicit] + [c for c in candidates if c is not explicit]
+            result = GroundingResult(
+                role=role,
+                candidates=candidates,
+                selected=explicit,
+                needs_clarification=False,
+                ambiguity_gap=(explicit.total_score - candidates[1].total_score)
+                if len(candidates) > 1 else explicit.total_score,
+            )
+            return result
+
         # ── Phase 5: Ambiguity detection ──
         result = self._build_result(candidates, role)
         return result
+
+    def _select_explicit_descriptor(
+        self, candidates: List[ScoredCandidate], instruction: str, scene: Any
+    ) -> Optional[ScoredCandidate]:
+        """Select a unique candidate for an explicit physical descriptor.
+
+        This is deliberately conservative: only candidates with positive
+        category evidence participate, and a descriptor is accepted only when
+        it identifies exactly one extreme/size peer.  Genuine ties continue
+        through the normal ambiguity gate.
+        """
+        if not candidates or scene is None:
+            return None
+        hints = list(dict.fromkeys(
+            self.config.derive_spatial_hints(instruction)
+            + self.config.derive_size_hints(instruction)
+            + self.config.derive_ordinal_hints(instruction)
+        ))
+        if not hints:
+            return None
+
+        eligible = [
+            c for c in candidates
+            if c.score_components.get("category_match", 0.0) > 0
+            and not c.hard_rejections
+            and c.entity_ref.entity_id
+        ]
+        # Bare size references such as “那个小的” omit the noun.  If all
+        # remaining candidates share one concrete class, that class is the
+        # eligible peer group; unrelated scene objects are not competitors.
+        if len(eligible) < 2:
+            same_class = [c for c in candidates if not c.hard_rejections and c.entity_ref.entity_id]
+            classes = {
+                c.entity_ref.specific_class or c.entity_ref.parent_class
+                for c in same_class
+                if c.entity_ref.specific_class or c.entity_ref.parent_class
+            }
+            if len(classes) == 1:
+                eligible = same_class
+        if len(eligible) < 2:
+            return None
+        objects = []
+        by_id = {getattr(o, "id", ""): o for o in (getattr(scene, "objects", []) or [])}
+        for c in eligible:
+            obj = by_id.get(c.entity_ref.entity_id)
+            if obj is not None:
+                objects.append(obj)
+        if len(objects) < 2:
+            return None
+
+        def pos_value(obj: Any, axis: str) -> float:
+            return float(getattr(getattr(obj, "position", None), axis, 0.0))
+
+        def volume(obj: Any) -> float:
+            box = getattr(obj, "bbox", None)
+            return (
+                float(getattr(box, "width", 0.0))
+                * float(getattr(box, "height", 0.0))
+                * float(getattr(box, "depth", 0.0))
+            ) if box is not None else 0.0
+
+        target_ids: Set[str] = set()
+        spatial = self.config.spatial
+        for hint in hints:
+            if hint in ("left", "leftmost", "right", "rightmost"):
+                axis = spatial.axis_for(hint)
+                if axis is None:
+                    continue
+                values = [pos_value(o, axis) for o in objects]
+                want_min = (hint in ("left", "leftmost")) == spatial.left_is_lower
+                extreme = min(values) if want_min else max(values)
+                ids = {getattr(o, "id", "") for o in objects if abs(pos_value(o, axis) - extreme) <= 1e-6}
+            elif hint in ("front", "frontmost", "back", "backmost"):
+                axis = spatial.front_back_axis
+                values = [pos_value(o, axis) for o in objects]
+                want_min = hint in ("front", "frontmost") != spatial.front_is_higher
+                extreme = min(values) if want_min else max(values)
+                ids = {getattr(o, "id", "") for o in objects if abs(pos_value(o, axis) - extreme) <= 1e-6}
+            elif hint in ("high", "highest", "low", "lowest"):
+                values = [pos_value(o, spatial.up_down_axis) for o in objects]
+                extreme = max(values) if hint in ("high", "highest") else min(values)
+                ids = {getattr(o, "id", "") for o in objects if abs(pos_value(o, spatial.up_down_axis) - extreme) <= 1e-6}
+            elif hint in ("near", "nearest", "far", "farthest"):
+                def dist(o: Any) -> float:
+                    return sum(pos_value(o, a) ** 2 for a in ("x", "y", "z")) ** 0.5
+                values = [dist(o) for o in objects]
+                extreme = min(values) if hint in ("near", "nearest") else max(values)
+                ids = {getattr(o, "id", "") for o in objects if abs(dist(o) - extreme) <= 1e-6}
+            elif hint in ("small", "smallest", "large", "largest"):
+                values = [volume(o) for o in objects]
+                extreme = min(values) if hint in ("small", "smallest") else max(values)
+                ids = {getattr(o, "id", "") for o in objects if abs(volume(o) - extreme) <= 1e-9}
+            else:
+                continue
+            if len(ids) == 1:
+                target_ids = ids
+                break
+
+        if len(target_ids) != 1:
+            return None
+        target_id = next(iter(target_ids))
+        return next((c for c in eligible if c.entity_ref.entity_id == target_id), None)
 
     def ground_theme(self, instruction: str, scene: Any, **kwargs) -> GroundingResult:
         return self.ground(instruction, scene, role="theme", **kwargs)
@@ -2169,6 +2331,27 @@ class GroundingEngine:
             )
             return result
 
+        # Ranking is not grounding.  A candidate must carry positive evidence
+        # from the mention (or from an explicit role affordance such as
+        # ``支撑面``).  Without this gate, a scene object could win merely
+        # because it is the least-bad candidate and receive a fabricated ID.
+        evidence_candidates = [
+            c for c in candidates
+            if not c.hard_rejections and self._has_grounding_evidence(c, role)
+        ]
+        if not evidence_candidates:
+            result.needs_clarification = True
+            result.clarification = ClarificationRequest(
+                role=role,
+                question=f"No scene entity has sufficient evidence for role '{role}'",
+            )
+            result.selected = None
+            result.ambiguity_gap = 0.0
+            return result
+
+        # Never let an evidence-free candidate compete with a supported one.
+        candidates = evidence_candidates
+        result.candidates = candidates
         top1 = candidates[0]
         top2 = candidates[1] if len(candidates) > 1 else None
 
@@ -2202,6 +2385,28 @@ class GroundingEngine:
         result.selected = top1
         result.needs_clarification = False
         return result
+
+    @staticmethod
+    def _has_grounding_evidence(candidate: ScoredCandidate, role: str) -> bool:
+        """Return whether a candidate is supported by observable semantics.
+
+        Category/attribute/spatial evidence is required for object roles.  A
+        generic surface expression is also valid when the scene explicitly
+        advertises a support/fixed affordance; this is the only intentional
+        affordance-only exception because ``支撑面`` is a functional role, not
+        an object category.
+        """
+        comps = candidate.score_components
+        if comps.get("category_match", 0.0) > 0:
+            return True
+        if any(comps.get(key, 0.0) > 0 for key in (
+            "color_match", "material_match", "size_match", "spatial_match",
+            "ordinal_match", "motion_match", "exact_original_id_match",
+        )):
+            return True
+        if role in ("support_surface", "destination") and comps.get("role_affordance_match", 0.0) > 0:
+            return True
+        return False
 
     def _generate_clarification_question(
         self, top_candidates: List[ScoredCandidate], role: str
@@ -2518,6 +2723,14 @@ def apply_grounding_invariants(
 def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optional[Dict[str, Any]] = None) -> ParsedTask:
     normalized = _normalize_text(instruction)
     action = _classify_action(normalized)
+    # Conditional fetches and colloquial “帮我拿一下” contain a delivery
+    # intent even when the surface verb is only “拿”.  Promote them before
+    # fusion so the LLM cannot collapse the task to a bare GRASP.
+    if action == TaskActionKind.GRASP and re.search(
+        r"(?:否则|不然)\s*(?:拿|取|抓)|如果.+?(?:拿它|取它).*(?:否则|不然)|帮我拿一下|帮我取一下",
+        normalized,
+    ):
+        action = TaskActionKind.FETCH
     motion_state = _extract_motion_state(normalized)
     if action == TaskActionKind.GRASP and motion_state.state == "moving":
         action = TaskActionKind.DYNAMIC_GRASP
@@ -2545,6 +2758,22 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
     if logical_ast.sequences:
         notes.append(f"sequence_detected:{len(logical_ast.sequences)} sequences")
 
+    composite_steps: List[Dict[str, Any]] = []
+    for seq in logical_ast.sequences:
+        for logical_step in seq.steps:
+            raw_action = str(logical_step.action or "CUSTOM").upper()
+            try:
+                step_action = TaskActionKind(raw_action).value
+            except ValueError:
+                step_action = TaskActionKind.CUSTOM.value
+            composite_steps.append({
+                "step_index": len(composite_steps) + 1,
+                "action": step_action,
+                "theme_mention": logical_step.theme_ref,
+                "destination_mention": logical_step.destination_ref,
+                "description": logical_step.raw_text,
+            })
+
     # ── Initialize GroundingEngine ──
     engine = GroundingEngine()
     # Derive color hint for theme, excluding colors that only appear in negated clauses
@@ -2556,6 +2785,7 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
     _color_hint = engine.config.derive_color_hint(normalized, exclude_colors=_negated_colors)
 
     theme: Optional[SemanticEntityRef] = None
+    source: Optional[SemanticEntityRef] = None
     destination: Optional[SemanticEntityRef] = None
     recipient: Optional[SemanticEntityRef] = None
     support_surface: Optional[SemanticEntityRef] = None
@@ -2563,7 +2793,7 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
 
     # Role-local spans prevent every mentioned object from competing for every
     # semantic role. Entity IDs are still selected exclusively from the scene.
-    role_text = {"theme": instruction, "destination": instruction,
+    role_text = {"theme": instruction, "source": instruction, "destination": instruction,
                  "support_surface": instruction, "obstacle": instruction}
     if action == TaskActionKind.PLACE:
         place_match = re.search(
@@ -2576,6 +2806,79 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
             role_text["theme"] = place_match.group(1).strip()
             role_text["destination"] = place_match.group(2).strip()
             role_text["support_surface"] = place_match.group(2).strip()
+    # Role-local clause extraction for open paraphrases.  Scoring the whole
+    # sentence makes the obstacle/destination compete with the theme.
+    place_clause = re.search(
+        r"\u628a\s*(.+?)\s*\u653e(?:\u5230|\u5728|\u5165|\u8fdb)\s*(.+?)(?:\u4e0a\u9762|\u4e0a|\u91cc|\u4e2d)?(?:[\uff0c,\u3002。]|$)",
+        normalized,
+    )
+    if place_clause:
+        role_text["theme"] = place_clause.group(1).strip()
+        role_text["destination"] = place_clause.group(2).strip()
+        role_text["support_surface"] = place_clause.group(2).strip()
+    transfer_clause = re.search(
+        r"(?:把|将|请将)?\s*(.+?)\s*(?:上料到|搬运到|送到|运到|转移到|移到)\s*(.+?)(?:[，,。；;]|$)",
+        normalized,
+    )
+    if transfer_clause:
+        role_text["theme"] = transfer_clause.group(1).strip()
+        role_text["destination"] = transfer_clause.group(2).strip()
+    source_clause = re.search(r"从\s*(.+?)\s*(?:移|搬|转|送|运)到", normalized)
+    if source_clause:
+        role_text["source"] = source_clause.group(1).strip()
+    contrast_clause = re.search(
+        r"(?:\u4e0d\u8981\u78b0|\u522b\u78b0|\u907f\u5f00|\u4e0d\u8981\u63a5\u89e6)\s*(.+?)[\uff0c,]\s*(?:\u628a)?\s*(.+?)(?:\u62ff\u8fc7\u6765|\u62ff\u8d77|\u62ff|\u62ff\u6765|\u62ff\u7ed9|\u62c9\u8fc7\u6765)",
+        normalized,
+    )
+    if contrast_clause:
+        role_text["obstacle"] = contrast_clause.group(1).strip()
+        role_text["theme"] = contrast_clause.group(2).strip()
+    conditional_clause = re.search(
+        r"(?:\u5982\u679c\u770b\u5230|\u5982\u679c)\s*(.+?)\s*(?:\u5c31|\u5219)\s*(?:\u5148)?\u62ff[^，,。；;]*[，,。；;]\s*(?:\u5426\u5219|\u5426\u5219\u62ff)\s*(.+)",
+        normalized,
+    )
+    if conditional_clause:
+        role_text["theme"] = conditional_clause.group(1).strip()
+    # Action-first clauses keep the target and the avoided object in separate
+    # grounding spans: “抓住玻璃杯，别碰塑料杯”.
+    action_contrast = re.search(
+        r"(?:抓住|拿起|拿来|拿过来|推过来|移动|夹住|捡起)\s*(.+?)[，,]\s*"
+        r"(?:别碰|不要碰|避开|不要接触)\s*(.+?)(?:[，,。；;]|$)",
+        normalized,
+    )
+    if action_contrast:
+        role_text["theme"] = action_contrast.group(1).strip()
+        role_text["obstacle"] = action_contrast.group(2).strip()
+    else:
+        # Normalization converts Chinese punctuation to ASCII.  A literal
+        # clause split is more robust than another regex for colloquial forms
+        # such as “把盒子拿过来，千万别碰玻璃杯”.
+        for caution in ("别碰", "不要碰", "避开", "不要接触"):
+            if caution not in normalized:
+                continue
+            left, right = normalized.split(caution, 1)
+            if not re.search(r"抓住|拿起|拿来|拿过来|推过来|移动|夹住|捡起", left):
+                continue
+            theme_text = re.sub(
+                r"^(?:把|将|请将)?\s*(?:抓住|拿起|拿来|拿过来|推过来|移动|夹住|捡起)\s*",
+                "", left,
+            ).strip(" ,")
+            obstacle_text = right.strip(" ,。；;")
+            if theme_text and obstacle_text:
+                role_text["theme"] = theme_text
+                role_text["obstacle"] = obstacle_text
+                break
+    # In “先抓住杯子，再放到桌子上”, the first clause is the theme and
+    # the second clause supplies the destination/support surface.
+    sequence_clause = re.search(
+        r"先(?:抓住|拿起|拿|夹住|捡起)\s*(.+?)\s*(?:再|然后|之后)\s*"
+        r"(?:放到|放在|放入|放进)\s*(.+?)(?:[，,。；;]|$)",
+        normalized,
+    )
+    if sequence_clause:
+        role_text["theme"] = sequence_clause.group(1).strip()
+        role_text["destination"] = sequence_clause.group(2).strip()
+        role_text["support_surface"] = sequence_clause.group(2).strip()
     obstacle_match = (
         re.search(r"在不接触\s*([^，,。；;]+?)\s*的情况下", normalized)
         or re.search(
@@ -2589,7 +2892,14 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
     # ── Per-role grounding ──
     if scene is not None:
         # ── Theme ──
-        theme_result = engine.ground(role_text["theme"], scene, role="theme", color_hint=_color_hint)
+        # Color belongs to the theme span, not to the whole instruction.  In
+        # “不要碰红色的，把蓝色的拿过来”, the red mention is an obstacle and
+        # must never poison theme grounding.
+        theme_color_hint = engine.config.derive_color_hint(
+            role_text["theme"],
+            exclude_colors=_negated_colors,
+        ) or _color_hint
+        theme_result = engine.ground(role_text["theme"], scene, role="theme", color_hint=theme_color_hint)
         if theme_result.selected is not None:
             theme = theme_result.selected.entity_ref
             theme.grounding_confidence = min(theme_result.selected.total_score, 1.0)
@@ -2599,6 +2909,27 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
             if theme_result.clarification:
                 notes.append(f"clarification_needed:theme={theme_result.clarification.question}")
             # theme stays None → will trigger unmet_roles → BLOCKED/NEEDS_CLARIFICATION
+
+        # Demonstratives are resolvable when perception exposes exactly one
+        # object, even if the generic scorer produced low-confidence
+        # candidates.  This covers “那个东西/那玩意儿/这个”.
+        if theme is None and len(getattr(scene, "objects", []) or []) == 1:
+            demo = re.search(r"(?:那个|这个|那玩意|这玩意|那东西|这东西|that thing|the thing)", normalized, re.I)
+            if demo:
+                theme = SemanticEntityRef.from_scene_object(
+                    scene.objects[0], role="theme", text_span=demo.group(0)
+                )
+                theme.grounding_confidence = 0.35
+                theme.match_evidence = ["demonstrative_fallback:single_object +0.35"]
+
+        # A pure conditional such as “除非夹爪是空的，否则不要抓取” has no
+        # noun, but a single visible target still supplies the only legal
+        # grounding candidate.  The condition itself remains a safety gate.
+        if theme is None and len(getattr(scene, "objects", []) or []) == 1:
+            if action in (TaskActionKind.GRASP, TaskActionKind.FETCH, TaskActionKind.PLACE):
+                theme = SemanticEntityRef.from_scene_object(scene.objects[0], role="theme", text_span="唯一可见目标")
+                theme.grounding_confidence = 0.30
+                theme.match_evidence = ["single_object_fallback:implicit_target +0.30"]
 
         # Exclude theme from subsequent roles
         _exclude_ids: Set[str] = {theme.entity_id} if theme and theme.entity_id else set()
@@ -2613,6 +2944,17 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
             destination = dest_result.selected.entity_ref
             destination.grounding_confidence = min(dest_result.selected.total_score, 1.0)
             _exclude_ids.add(destination.entity_id)
+
+        # Industrial transfer may explicitly name a source station/bin.  It
+        # is optional in the TRANSFER schema, but when present it is grounded
+        # by the same deterministic engine rather than copied from text.
+        if action == TaskActionKind.TRANSFER and role_text.get("source") != instruction:
+            src_result = engine.ground(role_text["source"], scene, role="source",
+                                       exclude_ids=_exclude_ids)
+            if src_result.selected is not None:
+                source = src_result.selected.entity_ref
+                source.grounding_confidence = min(src_result.selected.total_score, 1.0)
+                _exclude_ids.add(source.entity_id)
 
         # ── Support surface ──
         ss_color_hint = engine.config.derive_color_hint(role_text["support_surface"])
@@ -2656,7 +2998,8 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
         if theme is None and scene is not None:
             _DEMONSTRATIVES = ("那个", "这个", "那玩意", "这玩意", "那东西", "这东西",
                               "那个东西", "那个小的", "那个大的")
-            has_demonstrative = any(d in normalized for d in _DEMONSTRATIVES)
+            has_demonstrative = any(d in normalized for d in _DEMONSTRATIVES) or bool(
+                re.search(r"(?:\u90a3\u4e2a\u4e1c\u897f|\u90a3\u73a9\u610f\u513f|\u90a3\u4e1c\u897f|that thing|the thing)", normalized, re.I))
             scene_objs = getattr(scene, "objects", []) or []
             if has_demonstrative and len(scene_objs) == 1:
                 obj = scene_objs[0]
@@ -2679,11 +3022,11 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
         if best_alias:
             theme.mention = best_alias
             theme.text_span = best_alias
-        if _color_hint:
+        if theme_color_hint:
             from robot_intent_agent.config.grounding_config import get_grounding_config
             _color_map = get_grounding_config().color_map
             for alias in cn_aliases:
-                cn_full = next((cw for cw, ce in _color_map.items() if ce == _color_hint), "") + alias
+                cn_full = next((cw for cw, ce in _color_map.items() if ce == theme_color_hint), "") + alias
                 if cn_full in normalized:
                     theme.mention = cn_full
                     theme.text_span = cn_full
@@ -2696,8 +3039,10 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
         recipient = _ground_entity_from_text(normalized, role="recipient", scene=scene,
                                              exclude_ids=_exclude_ids)
 
-    # HANDOVER/FETCH/TRANSFER: recipient is required
-    if action in (TaskActionKind.HANDOVER, TaskActionKind.FETCH, TaskActionKind.TRANSFER) and recipient is None:
+    # Recipient is an execution role only for delivery/handover language.
+    # Industrial TRANSFER is defined by theme + destination; it must not
+    # fabricate a user recipient merely because the Chinese verb means move.
+    if action in (TaskActionKind.HANDOVER, TaskActionKind.FETCH) and recipient is None:
         recipient = SemanticEntityRef(
             mention="用户",
             specific_class="human",
@@ -2711,7 +3056,7 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
         )
 
     # HANDOVER: destination must NOT be the recipient
-    if action in (TaskActionKind.HANDOVER, TaskActionKind.FETCH, TaskActionKind.TRANSFER):
+    if action in (TaskActionKind.HANDOVER, TaskActionKind.FETCH):
         if destination is not None and destination.entity_id in ("user", "我"):
             destination = None
 
@@ -2903,24 +3248,28 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
     constraint_confidence = 0.95 if user_constraints else 0.4
 
     unmet_roles: List[str] = []
-    if action in (TaskActionKind.FETCH, TaskActionKind.HANDOVER, TaskActionKind.TRANSFER):
+    if action == TaskActionKind.HANDOVER:
         if recipient is None:
             unmet_roles.append("recipient")
         elif recipient.entity_id == "user":
-            if action == TaskActionKind.HANDOVER:
-                unmet_roles.append("recipient_pose_or_handover_zone")
-            else:
-                unmet_roles.append("delivery_pose_or_fetch_zone")
+            unmet_roles.append("recipient_pose_or_handover_zone")
+    elif action == TaskActionKind.FETCH:
+        if destination is None and recipient is None:
+            unmet_roles.append("delivery_pose_or_fetch_zone")
+        elif recipient is not None and recipient.entity_id == "user" and destination is None:
+            unmet_roles.append("delivery_pose_or_fetch_zone")
+    elif action == TaskActionKind.TRANSFER and destination is None:
+        unmet_roles.append("destination")
     if action == TaskActionKind.PLACE and support_surface is None and destination is None:
         unmet_roles.append("support_surface")
     if theme is None:
         unmet_roles.append("theme")
 
-    return ParsedTask(
+    parsed_result = ParsedTask(
         instruction=instruction,
         action=action,
         theme=theme,
-        source=None,
+        source=source,
         destination=destination,
         recipient=recipient,
         obstacle=obstacles,
@@ -2934,7 +3283,145 @@ def parse_task_semantics(instruction: str, scene: Any = None, robot_state: Optio
         grounding_confidence=grounding_confidence,
         constraint_confidence=constraint_confidence,
         notes=notes,
+        steps=composite_steps,
     )
+    # Build the independent semantic graph after the compatibility parser has
+    # completed.  The graph is diagnostic/intermediate data; legacy fields are
+    # still populated above and remain the adapter consumed by old callers.
+    try:
+        from robot_intent_agent.semantic_parser.semantic_pipeline import SemanticPipeline
+        semantic_candidate = SemanticPipeline().parse_rule(instruction, scene=scene)
+        parsed_result.semantic_task_graph = semantic_candidate.graph.model_dump(mode="json")
+        parsed_result.execution_contract = {
+            "schema_complete": bool(semantic_candidate.graph.events),
+            "entity_ids_verified": all(
+                not entity.entity_id or (scene is not None and any(
+                    getattr(obj, "id", None) == entity.entity_id
+                    for obj in getattr(scene, "objects", []) or []
+                )) for entity in semantic_candidate.graph.entities
+            ),
+            "roles_complete": SemanticPipeline().diagnostics(semantic_candidate, scene).get("roles_complete", False),
+            "constraints_resolved": True,
+            "behavior_tree_consistent": False,
+            "execution_allowed": False,
+        }
+    except Exception as exc:
+        # Compatibility parsing must never fail because the optional graph
+        # adapter is unavailable; retain an auditable diagnostic.
+        parsed_result.notes.append(f"semantic_graph_adapter_error:{type(exc).__name__}")
+    # Transfer only IDs already selected by the deterministic compatibility
+    # grounder into the local graph references.  This is binding, not a new
+    # source of entity guesses.
+    if isinstance(parsed_result.semantic_task_graph, dict):
+        graph_data = parsed_result.semantic_task_graph
+        role_refs = graph_data.get("metadata", {}).get("role_refs", {}) if isinstance(graph_data.get("metadata"), dict) else {}
+        role_values = parsed_result.role_map()
+
+        # The rule grounder intentionally rejects unknown open-vocabulary
+        # mentions instead of fabricating an ID.  The semantic graph still
+        # carries the mention, so perform one conservative scene-only
+        # re-binding pass here.  This is what lets phrases such as “镜片盒”
+        # resolve to “光学聚焦镜片盒” while keeping IDs perception-owned.
+        scene_objects = list(getattr(scene, "objects", []) or []) if scene is not None else []
+        bound_open_entities: Dict[str, Any] = {}
+        for graph_entity in graph_data.get("entities", []) or []:
+            if graph_entity.get("entity_id") or not scene_objects:
+                continue
+            mention = str(graph_entity.get("mention") or "").strip()
+            if not mention:
+                continue
+            matches = []
+            for obj in scene_objects:
+                names = [
+                    str(getattr(obj, "name", "") or ""),
+                    str(getattr(obj, "label", "") or ""),
+                    str(getattr(obj, "specific_class", "") or ""),
+                ]
+                if any(name and (mention in name or name in mention) for name in names):
+                    matches.append(obj)
+            if len(matches) == 1:
+                obj = matches[0]
+                graph_entity["entity_id"] = getattr(obj, "id", None)
+                bound_open_entities[graph_entity.get("local_ref", "")] = obj
+                graph_entity.setdefault("evidence_spans", []).append(
+                    f"scene_name_match:{getattr(obj, 'name', '')}"
+                )
+
+        for role, local_ref in role_refs.items():
+            entity = role_values.get(role)
+            if entity is None and role == "obstacle":
+                entity = next(iter(parsed_result.obstacle), None)
+            if entity is None and local_ref in bound_open_entities:
+                obj = bound_open_entities[local_ref]
+                entity = SemanticEntityRef.from_scene_object(
+                    obj, role=role,
+                    text_span=next(
+                        (str(item.get("mention")) for item in graph_data.get("entities", []) or []
+                         if item.get("local_ref") == local_ref),
+                    ),
+                )
+                setattr(parsed_result, role if role != "obstacle" else "obstacle", entity if role != "obstacle" else [entity])
+                role_values[role] = entity
+            if entity is None:
+                continue
+            for graph_entity in graph_data.get("entities", []) or []:
+                if graph_entity.get("local_ref") == local_ref:
+                    graph_entity["entity_id"] = entity.entity_id
+                    graph_entity.setdefault("evidence_spans", []).extend(entity.match_evidence or [])
+        parsed_result.grounding_decisions = [
+            {"role": role, "selected_entity_id": value.entity_id,
+             "candidate_ids": [value.entity_id] if value.entity_id else [],
+             "evidence": list(value.match_evidence or []),
+                     "decision": "RESOLVED" if value.entity_id else "NEEDS_CLARIFICATION"}
+            for role, value in parsed_result.role_map().items() if value is not None
+        ]
+        # The split grounding package is the joint-role authority.  Run it as
+        # an auditable second pass; it may fill graph IDs only when the scene
+        # supplies the candidate and never invents physical IDs.
+        if scene is not None:
+            try:
+                from robot_intent_agent.schemas.semantic_task_graph import SemanticTaskGraph
+                from robot_intent_agent.grounding.grounding_engine import GroundingEngine as UnifiedGroundingEngine
+                graph_model = SemanticTaskGraph.model_validate(graph_data)
+                grounded_graph, joint_decisions = UnifiedGroundingEngine().ground_graph(graph_model, scene)
+                for graph_entity in graph_data.get("entities", []) or []:
+                    if graph_entity.get("entity_id"):
+                        continue
+                    unified_entity = grounded_graph.entity(graph_entity.get("local_ref", ""))
+                    if unified_entity and unified_entity.entity_id:
+                        graph_entity["entity_id"] = unified_entity.entity_id
+                for role, decision in (joint_decisions or {}).items():
+                    parsed_result.grounding_decisions.append({
+                        "role": role,
+                        "selected_entity_id": decision.selected_entity_id,
+                        "candidate_ids": list(decision.candidate_ids),
+                        "evidence": list(decision.evidence),
+                        "margin": decision.margin,
+                        "decision": decision.decision,
+                        "engine": "JointGroundingSolver",
+                    })
+            except Exception as exc:
+                parsed_result.notes.append(f"joint_grounding_audit_error:{type(exc).__name__}")
+        if parsed_result.theme is not None and "theme" in parsed_result.unmet_roles:
+            parsed_result.unmet_roles.remove("theme")
+        if parsed_result.theme is not None:
+            parsed_result.grounding_confidence = max(parsed_result.grounding_confidence, 0.85)
+    from robot_intent_agent.semantic_reasoner.ambiguity import classify_ambiguities
+    ambiguity_report = classify_ambiguities(instruction, parsed_result, scene=scene)
+    if ambiguity_report:
+        parsed_result.notes.extend(
+            f"ambiguity:{item['type']}:{item['strategy']}" for item in ambiguity_report
+        )
+        parsed_result.parse_confidence = min(parsed_result.parse_confidence, 0.70)
+        parsed_result.ambiguity_resolution = list(ambiguity_report)
+    if parsed_result.semantic_task_graph:
+        parsed_result.execution_contract["entity_ids_verified"] = all(
+            not item.get("entity_id") or (scene is not None and any(
+                getattr(obj, "id", None) == item.get("entity_id")
+                for obj in getattr(scene, "objects", []) or []
+            )) for item in parsed_result.semantic_task_graph.get("entities", [])
+        )
+    return parsed_result
 
 
 def load_parsed_task_from_bt(
@@ -2957,8 +3444,55 @@ def load_parsed_task_from_bt(
 
     Fallback is explicitly tracked in bt_metadata['engine_trace'].
     """
+    # SemanticCompiler owns the final graph.  This branch is deliberately
+    # before every compatibility parser call: downstream consumers must use
+    # the graph projection and must never re-interpret the raw instruction.
+    semantic_graph_data = bt_metadata.get("semantic_task_graph")
+    if isinstance(semantic_graph_data, dict) and (
+        bt_metadata.get("semantic_authority") == "SemanticCompiler"
+        or bt_metadata.get("compiler") == "SemanticCompiler"
+    ):
+        try:
+            from robot_intent_agent.schemas.semantic_task_graph import SemanticTaskGraph
+            from robot_intent_agent.semantic_compiler import parsed_task_from_graph
+            graph = SemanticTaskGraph.model_validate(semantic_graph_data)
+            projected = parsed_task_from_graph(
+                graph,
+                instruction,
+                scene=scene,
+                grounding_decisions=bt_metadata.get("grounding_decisions") or [],
+                fusion_trace=bt_metadata.get("fusion_trace") or [],
+            )
+            projected.notes.append("source:semantic_compiler_graph_projection")
+            return projected
+        except Exception as exc:
+            # A graph-authored plan cannot silently fall back to a second
+            # semantic interpretation.  Surface a clear failure to the final
+            # validator instead of re-parsing the instruction.
+            raise ValueError(f"semantic compiler graph projection failed: {exc}") from exc
+
     raw_parsed = bt_metadata.get("parsed_task")
+    # Always compute the deterministic interpretation as the safety baseline.
+    # LLM output is a semantic supplement, never a replacement for fields
+    # already evidenced by the original instruction.
+    rule_task = parse_task_semantics(instruction, scene=scene)
     engine_trace = bt_metadata.get("engine_trace", {})
+    # New semantic-candidate metadata is read as an intermediate graph only;
+    # it does not override the compatibility task or any grounded ID.
+    if isinstance(bt_metadata.get("semantic_task_graph"), dict):
+        rule_task.semantic_task_graph = bt_metadata["semantic_task_graph"]
+    if isinstance(bt_metadata.get("fusion_trace"), list):
+        rule_task.fusion_trace = list(bt_metadata["fusion_trace"])
+
+    # Hybrid negative-gain protection: the rule baseline is already the
+    # validated result, so do not re-enter it through the LLM fusion boundary.
+    if isinstance(engine_trace, dict) and engine_trace.get("llm_fusion_rejected"):
+        rule_task.notes.append("llm_rejected:negative_gain_protection")
+        rule_task.notes.extend(
+            f"llm_rejection:{reason}"
+            for reason in (engine_trace.get("llm_rejection_reasons") or [])
+        )
+        return rule_task
 
     if isinstance(raw_parsed, dict):
         try:
@@ -2984,10 +3518,34 @@ def load_parsed_task_from_bt(
             llm_frame = bt_metadata.get("semantic_frame_version") == "1.0"
             llm_trace = any("deepseek" in str(engine_trace.get(k, "")).lower()
                             for k in ("actual_engine", "requested_engine", "planner"))
-            if scene is not None and (llm_frame or llm_trace):
-                pt = _reground_llm_parsed_task(pt, instruction, scene)
-
-            return pt
+            if scene is None or not (llm_frame or llm_trace):
+                # Rule planner metadata already contains role-local grounding;
+                # never treat it as an LLM payload and clear its IDs.
+                return pt
+            raw_llm_ids = {
+                role: getattr(getattr(pt, role, None), "entity_id", None)
+                for role in ("theme", "source", "destination", "recipient", "support_surface")
+            }
+            merged = merge_parsed_tasks(rule_task, pt, instruction)
+            for role, raw_id in raw_llm_ids.items():
+                if raw_id:
+                    merged.notes.append(f"cleared_llm_entity_id:{role}={raw_id}")
+            # Fusion may replace a role with an LLM semantic reference;
+            # perform the single authoritative grounding pass afterwards.
+            merged = _reground_llm_parsed_task(merged, instruction, scene)
+            if isinstance(engine_trace, dict):
+                engine_trace["llm_fusion"] = {
+                    "baseline": "rule_engine",
+                    "accepted_fields": _llm_delta_fields(rule_task, pt),
+                    "protected_fields": [
+                        "entity_id", "user_constraints", "obstacle",
+                        "prohibitions", "execution_allowed", "plan_status",
+                    ],
+                    "final_authority": "deterministic_grounding_and_validation",
+                }
+                bt_metadata = bt_metadata if isinstance(bt_metadata, dict) else {}
+                bt_metadata["engine_trace"] = engine_trace
+            return merged
         except Exception as e:
             # LLM provided parsed_task but schema invalid → record and fall back
             if engine_trace:
@@ -2998,11 +3556,141 @@ def load_parsed_task_from_bt(
             # Fall through to RuleEngine
 
     # Fallback: RuleEngine
-    pt = parse_task_semantics(instruction, scene=scene)
+    pt = rule_task
     if pt.notes is None:
         pt.notes = []
     pt.notes.append("source:rule_engine_fallback")
     return pt
+
+
+def merge_parsed_tasks(rule_task: "ParsedTask", llm_task: "ParsedTask", instruction: str) -> "ParsedTask":
+    """Field-wise semantic fusion with deterministic safety precedence.
+
+    Rule extraction is authoritative for explicit constraints, negations,
+    steps, and source text. LLM may add roles/descriptors when they are
+    grounded in the same instruction, but it cannot erase rule evidence.
+    """
+    merged = deepcopy(rule_task)
+    cleared_ids: List[str] = []
+    # Preserve an explicit deterministic action.  The LLM may enrich a rule
+    # frame with branches and roles, but it must not downgrade a clear
+    # delivery verb such as “拿过来/取过来” from FETCH to GRASP.
+    # If rules cannot classify the action, accept a validated LLM action.
+    if rule_task.action == TaskActionKind.CUSTOM and llm_task.action != TaskActionKind.CUSTOM:
+        merged.action = llm_task.action
+    for role in ("theme", "source", "destination", "recipient", "support_surface"):
+        candidate = getattr(llm_task, role, None)
+        current = getattr(merged, role, None)
+        # A scene-sourced role already has a deterministic entity binding.
+        # LLM descriptors may be incomplete (for example “support surface”)
+        # and must not overwrite a verified destination/table ID.
+        if current is not None and current.mention:
+            # The deterministic role span is the final baseline.  LLM may
+            # fill an absent role, but it cannot replace an already identified
+            # role with a different mention and thereby change grounding.
+            if candidate is not None and candidate.mention != current.mention:
+                merged.notes.append(f"protected_rule_role:{role}")
+            if candidate is not None and candidate.entity_id and candidate.entity_id != current.entity_id:
+                merged.notes.append(f"cleared_llm_entity_id:{role}={candidate.entity_id}")
+            continue
+        if candidate is not None and candidate.mention and (candidate.mention in instruction or not current):
+            # Remove any untrusted ID before the grounding boundary.
+            candidate = deepcopy(candidate)
+            if candidate.entity_id is not None:
+                cleared_ids.append(f"reground:cleared_llm_entity_id:{role}={candidate.entity_id}")
+            candidate.entity_id = None
+            candidate.source = "nl"
+            setattr(merged, role, candidate)
+    # Union by stable semantic content; rule constraints/obstacles are never
+    # deleted because the LLM omitted them.
+    merged.user_constraints = _union_models(rule_task.user_constraints, llm_task.user_constraints, "parameter")
+    merged.obstacle = _union_models(rule_task.obstacle, llm_task.obstacle, "mention")
+    # Merge structured records by identity instead of taking the first record.
+    # This preserves rule-detected safety evidence while allowing the LLM to
+    # fill a missing branch subject/action in the same condition or step.
+    merged.steps = _merge_structured_records(rule_task.steps, llm_task.steps, "step_index")
+    merged.conditions = _merge_structured_records(rule_task.conditions, llm_task.conditions, "condition_id")
+    merged.prohibitions = _merge_structured_records(rule_task.prohibitions, llm_task.prohibitions, "prohibition_id")
+    merged.raw_mentions = list(dict.fromkeys((rule_task.raw_mentions or []) + (llm_task.raw_mentions or [])))
+    merged.unmet_roles = list(dict.fromkeys((rule_task.unmet_roles or []) + (llm_task.unmet_roles or [])))
+    if not merged.manner and llm_task.manner:
+        merged.manner = llm_task.manner
+    if not merged.clarification and getattr(llm_task, "clarification", None):
+        merged.clarification = llm_task.clarification
+    merged.notes = list(dict.fromkeys((rule_task.notes or []) + (llm_task.notes or []) + ["fusion:rule_baseline+llm_fields"]))
+    merged.notes.extend(item for item in cleared_ids if item not in merged.notes)
+    merged.parse_confidence = max(rule_task.parse_confidence, llm_task.parse_confidence)
+    merged.constraint_confidence = max(rule_task.constraint_confidence, llm_task.constraint_confidence)
+    return merged
+
+
+def _union_models(left: List[Any], right: List[Any], key: str) -> List[Any]:
+    result: List[Any] = []
+    seen = set()
+    for item in list(left or []) + list(right or []):
+        if hasattr(item, "stable_key"):
+            marker = item.stable_key()
+        else:
+            value = item.get(key) if isinstance(item, dict) else getattr(item, key, None)
+            marker = repr(value) if value is not None else repr(item.model_dump() if hasattr(item, "model_dump") else item)
+        if marker not in seen:
+            seen.add(marker)
+            result.append(item)
+    return result
+
+
+def _merge_structured_records(left: List[Any], right: List[Any], key: str) -> List[Any]:
+    """Merge records by identity, filling only absent rule fields from LLM.
+
+    A non-empty rule value is authoritative.  Empty values in the rule record
+    may be enriched by a validated LLM record, which is what conditional
+    branches and branch-specific targets require.
+    """
+    result = [deepcopy(item) for item in (left or [])]
+    positions = {}
+    for index, item in enumerate(result):
+        marker = item.get(key) if isinstance(item, dict) else getattr(item, key, None)
+        if marker is not None:
+            positions[marker] = index
+    for incoming in right or []:
+        marker = incoming.get(key) if isinstance(incoming, dict) else getattr(incoming, key, None)
+        if marker not in positions:
+            result.append(deepcopy(incoming))
+            if marker is not None:
+                positions[marker] = len(result) - 1
+            continue
+        current = result[positions[marker]]
+        if hasattr(current, "model_dump"):
+            current_data = current.model_dump()
+            incoming_data = incoming.model_dump() if hasattr(incoming, "model_dump") else dict(incoming)
+            for field, value in incoming_data.items():
+                if field not in current_data or current_data[field] in (None, "", [], {}):
+                    current_data[field] = value
+            result[positions[marker]] = type(current).model_validate(current_data)
+        elif isinstance(current, dict):
+            incoming_data = incoming if isinstance(incoming, dict) else incoming.model_dump()
+            for field, value in incoming_data.items():
+                if field not in current or current[field] in (None, "", [], {}):
+                    current[field] = deepcopy(value)
+    return result
+
+
+def _llm_delta_fields(rule_task: "ParsedTask", llm_task: "ParsedTask") -> List[str]:
+    """Report semantic fields for which the validated LLM supplied evidence.
+
+    This is audit metadata only; it never controls execution.  It lets the
+    evaluator distinguish a real LLM contribution from a complete fallback.
+    """
+    fields: List[str] = []
+    for name in ("action", "theme", "source", "destination", "recipient",
+                 "support_surface", "manner", "user_constraints", "obstacle",
+                 "conditions", "steps", "prohibitions", "clarification"):
+        value = getattr(llm_task, name, None)
+        if value not in (None, "", [], {}):
+            rule_value = getattr(rule_task, name, None)
+            if value != rule_value or name in {"conditions", "steps", "prohibitions"}:
+                fields.append(name)
+    return fields
 
 
 def _reground_llm_parsed_task(
@@ -3021,12 +3709,43 @@ def _reground_llm_parsed_task(
     engine = GroundingEngine()
     color_hint = engine.config.derive_color_hint(instruction)
 
-    def _query(entity: Optional[SemanticEntityRef]) -> str:
+    def _theme_query() -> str:
+        """Recover the original clause that describes the theme.
+
+        LLM frames often keep only a noun (e.g. ``bottle``), which loses the
+        spatial/color/size evidence needed by deterministic grounding.  Use
+        the source clause as the query while keeping entity IDs exclusively
+        under GroundingEngine control.
+        """
+        q = instruction
+        for pattern in (
+            r"^(.+?)[，,]\s*(?:别碰|不要碰|避开|不要接触).+$",
+            r"^不要碰.+?[，,]\s*(?:把)?(.+)$",
+            r"^(?:如果|如果看到)(.+?)(?:就|则).+?[，,；;]\s*(?:否则|否则拿).+$",
+        ):
+            m = re.search(pattern, instruction)
+            if m:
+                q = m.group(1).strip()
+                break
+        place = re.search(r"(?:把|将)\s*(.+?)\s*(?:放到|放在|放入|放进)", q)
+        if place:
+            q = place.group(1).strip()
+        return q
+
+    theme_query = _theme_query()
+
+    def _query(entity: Optional[SemanticEntityRef], role: str = "theme") -> str:
         mention = (getattr(entity, "mention", "") or "").strip() if entity else ""
+        if role == "theme":
+            return theme_query if theme_query else (mention or instruction)
         return mention or instruction
 
     def _clear_untrusted_id(entity: Optional[SemanticEntityRef], role: str) -> None:
         if entity is None or (role == "recipient" and entity.entity_id == "user"):
+            return
+        if entity.entity_id is not None and entity.source == "scene":
+            # This ID came from the deterministic rule baseline, not from the
+            # LLM payload.  Preserve it across semantic fusion.
             return
         if entity.entity_id is not None:
             pt.notes.append(f"reground:cleared_llm_entity_id:{role}={entity.entity_id}")
@@ -3039,8 +3758,17 @@ def _reground_llm_parsed_task(
         _clear_untrusted_id(obs, "obstacle")
 
     # ── Re-ground theme ──
-    if pt.theme:
-        theme_result = engine.ground(_query(pt.theme), scene, role="theme", color_hint=color_hint)
+    if pt.theme is None and len(getattr(scene, "objects", []) or []) == 1:
+        if re.search(r"(?:那个|这个|那玩意|这玩意|那东西|这东西|that thing|the thing)", instruction, re.I):
+            pt.theme = SemanticEntityRef.from_scene_object(scene.objects[0], role="theme")
+            pt.theme.grounding_confidence = 0.35
+            pt.theme.match_evidence = ["demonstrative_fallback:single_object +0.35"]
+            pt.notes.append(f"reground:theme→{scene.objects[0].id} (single-object demonstrative)")
+    if pt.theme and pt.theme.entity_id and pt.theme.source == "scene":
+        pt.notes.append(f"reground:theme preserved deterministic binding→{pt.theme.entity_id}")
+    elif pt.theme:
+        theme_hint = engine.config.derive_color_hint(theme_query) or color_hint
+        theme_result = engine.ground(_query(pt.theme, "theme"), scene, role="theme", color_hint=theme_hint)
         if theme_result.selected is not None:
             pt.theme.entity_id = theme_result.selected.entity_ref.entity_id
             pt.theme.grounding_confidence = min(theme_result.selected.total_score, 1.0)
@@ -3054,11 +3782,55 @@ def _reground_llm_parsed_task(
                 pt.notes.append(f"reground:cleared hallucinated theme entity_id={pt.theme.entity_id}")
                 pt.theme.entity_id = None
 
-    # Exclude grounded theme from subsequent roles
+        # A demonstrative with exactly one visible object is deterministic;
+        # do not ask for clarification merely because its noun is omitted.
+        if pt.theme.entity_id is None and len(getattr(scene, "objects", []) or []) == 1:
+            if re.search(r"(?:那个|这个|那玩意|这玩意|那东西|这东西|that thing|the thing)", instruction, re.I):
+                only = scene.objects[0]
+                pt.theme.entity_id = only.id
+                pt.theme.source = "scene"
+                pt.theme.grounding_confidence = 0.35
+                pt.theme.match_evidence = ["demonstrative_fallback:single_object +0.35"]
+                pt.notes.append(f"reground:theme→{only.id} (single-object demonstrative)")
+
+    # Exclude the main theme before grounding branch-specific targets.
     exclude_ids = {pt.theme.entity_id} if pt.theme and pt.theme.entity_id else set()
 
+    # Conditional branches may carry their own semantic target (e.g. the
+    # red bottle on true and the blue box on false).  Ground each branch
+    # independently; never copy the main theme ID into both branches.
+    for condition in pt.conditions or []:
+        if not isinstance(condition, dict):
+            continue
+        for branch_key in ("subject", "on_true_subject", "on_false_subject"):
+            branch = condition.get(branch_key)
+            if not isinstance(branch, dict) or branch.get("entity_id"):
+                continue
+            mention = str(branch.get("mention") or "").strip()
+            attrs = branch.get("attributes") or {}
+            descriptors = [mention]
+            for key in ("color", "material", "size", "side", "height_relation", "distance_relation"):
+                value = attrs.get(key)
+                if value:
+                    descriptors.append(str(value))
+            query = " ".join(descriptors)
+            result = engine.ground(query or instruction, scene, role="theme", exclude_ids=exclude_ids)
+            if result.selected is not None:
+                branch["entity_id"] = result.selected.entity_ref.entity_id
+                branch["grounding_confidence"] = min(result.selected.total_score, 1.0)
+                branch["source"] = "scene"
+                branch["match_evidence"] = list(result.selected.evidence)
+                exclude_ids.add(result.selected.entity_ref.entity_id)
+                pt.notes.append(
+                    f"reground:condition:{condition.get('condition_id', 'unknown')}:{branch_key}"
+                    f"→{result.selected.entity_ref.entity_id}"
+                )
+
     # ── Re-ground destination ──
-    if pt.destination:
+    if pt.destination and pt.destination.entity_id and pt.destination.source == "scene":
+        exclude_ids.add(pt.destination.entity_id)
+        pt.notes.append(f"reground:destination preserved deterministic binding→{pt.destination.entity_id}")
+    elif pt.destination:
         dest_result = engine.ground(_query(pt.destination), scene, role="destination",
                                      exclude_ids=exclude_ids, color_hint=color_hint)
         if dest_result.selected is not None:
@@ -3070,7 +3842,10 @@ def _reground_llm_parsed_task(
             pt.notes.append(f"reground:destination→{pt.destination.entity_id}")
 
     # ── Re-ground support_surface ──
-    if pt.support_surface:
+    if pt.support_surface and pt.support_surface.entity_id and pt.support_surface.source == "scene":
+        exclude_ids.add(pt.support_surface.entity_id)
+        pt.notes.append(f"reground:support_surface preserved deterministic binding→{pt.support_surface.entity_id}")
+    elif pt.support_surface:
         support_exclude = set(exclude_ids)
         if pt.destination and pt.destination.entity_id:
             support_exclude.discard(pt.destination.entity_id)
@@ -3124,8 +3899,11 @@ def _reground_llm_parsed_task(
                             if obs.specific_class and obs.specific_class == c.entity_ref.specific_class:
                                 best = c
                                 break
-                    if best is None and obs_result.candidates:
-                        best = obs_result.candidates[0]
+                    # A ranked candidate is not enough for a prohibition:
+                    # binding an arbitrary scene object as an obstacle is
+                    # worse than retaining an unresolved prohibition and
+                    # failing closed.  GroundingEngine already applies the
+                    # shared evidence gate; do not bypass it here.
                     if best and best.total_score >= engine.config.min_accept_score:
                         obs.entity_id = best.entity_ref.entity_id
                         obs.grounding_confidence = min(best.total_score, 1.0)
@@ -3153,13 +3931,56 @@ def build_grounded_task(parsed_task: ParsedTask, scene: Any = None) -> GroundedT
         "support_surface": parsed_task.support_surface,
     }
     # Critical roles that MUST be present for each action type
-    critical_roles = {"theme"}
-    if parsed_task.action in (TaskActionKind.FETCH, TaskActionKind.HANDOVER, TaskActionKind.TRANSFER):
+    critical_roles = set() if parsed_task.action == TaskActionKind.WAIT else {"theme"}
+    if parsed_task.action in (TaskActionKind.FETCH, TaskActionKind.TRANSFER):
+        critical_roles.add("destination")
+    if parsed_task.action == TaskActionKind.HANDOVER:
         critical_roles.add("recipient")
     if parsed_task.action == TaskActionKind.PLACE:
         critical_roles.add("support_surface")
 
-    missing_roles = [name for name, value in grounded_roles.items() if value is None and name in critical_roles]
+    def _role_is_grounded(value: Optional[SemanticEntityRef]) -> bool:
+        # A role object without a scene-owned entity_id is only a language
+        # mention, not an executable binding.  This matters especially for
+        # WAIT descriptors: an equal pair of objects must remain unresolved.
+        return value is not None and bool(value.entity_id)
+
+    missing_roles = [name for name, value in grounded_roles.items()
+                     if name in critical_roles and not _role_is_grounded(value)]
+    if parsed_task.action == TaskActionKind.FETCH and parsed_task.destination is None:
+        if "destination" in missing_roles:
+            missing_roles.remove("destination")
+        if "delivery_pose_or_fetch_zone" not in missing_roles:
+            missing_roles.append("delivery_pose_or_fetch_zone")
+    required_clarifications = []
+    if parsed_task.action == TaskActionKind.WAIT:
+        if not parsed_task.conditions:
+            missing_roles.append("condition")
+        else:
+            # WAIT is itself the monitoring operation.  The condition is not
+            # required to be true at compile time: WaitUntil receives the
+            # condition and observes it at execution time.  Requiring a
+            # second confirmation here incorrectly turns every valid
+            # ``wait until ...`` request into NEEDS_CLARIFICATION.
+            pass
+
+    # A WAIT command may legitimately have no manipulated object, but a
+    # descriptive target clause must not be silently discarded.  This is the
+    # important distinction between a target-free wait ("wait until the
+    # scene is stable") and an unresolved wait ("wait until the larger object
+    # in the rear is stable").  The latter must ask for clarification when
+    # grounding did not bind a theme entity.
+    if parsed_task.action == TaskActionKind.WAIT and not _role_is_grounded(parsed_task.theme):
+        wait_text = parsed_task.instruction or ""
+        has_target_description = bool(re.search(
+            r"(?:\u5728\u73b0\u573a\u76ee\u6807\u4e2d|\u4f4d\u4e8e|\u64cd\u4f5c\u533a\u524d\u65b9|\u4e2d\u95f4\u504f\u540e|\u504f\u5c0f|\u504f\u5927|\u5c3a\u5bf8\u8f83\u5927|\u4e2d\u7b49\u5927\u5c0f|\u76ee\u6807(?:\u662f|\u4e3a))",
+            wait_text,
+        ))
+        if has_target_description:
+            if "theme" not in missing_roles:
+                missing_roles.append("theme")
+            if not any("WAIT" in str(item) or "target" in str(item).lower() for item in required_clarifications):
+                required_clarifications.append("WAIT target description cannot be grounded to a unique scene entity")
 
     # Detect fallback entities.
     scene_entity_ids = {getattr(o, "id", "") for o in getattr(scene, "objects", []) or []} if scene else set()
@@ -3169,22 +3990,58 @@ def build_grounded_task(parsed_task: ParsedTask, scene: Any = None) -> GroundedT
             return False
         if entity.source != "scene":
             return True
-        if role == "recipient" and entity.entity_id == "user":
+        if role == "recipient" and entity.entity_id in {"user", "operator"}:
             return True
         if role == "support_surface" and entity.entity_id not in scene_entity_ids:
             return True
         return False
 
-    # For HANDOVER/FETCH/TRANSFER: recipient identified as "user" → the real missing
+    def _scene_has_handover_endpoint() -> bool:
+        """Return whether perception exposes a safe human handover endpoint.
+
+        ``operator`` is a symbolic role, not a fabricated scene object.  It
+        is nevertheless executable when the observation contains a reachable
+        recipient endpoint (or an explicit handover-zone affordance).  If no
+        such evidence exists, the safety gate must keep the task pending.
+        """
+        for obj in getattr(scene, "objects", []) or []:
+            attrs = getattr(obj, "attributes", {}) or {}
+            upstream = attrs.get("_upstream_affordances", []) or []
+            if isinstance(upstream, str):
+                upstream = [upstream]
+            affordances = getattr(obj, "affordances", []) or []
+            affordance_values = {
+                str(item.value if hasattr(item, "value") else item).lower()
+                for item in affordances
+            }
+            upstream_values = {str(item).lower() for item in upstream}
+            category = str(getattr(obj, "specific_class", "") or "").lower()
+            if category in {"operator", "human", "person", "user"}:
+                return True
+            if ({"recipient", "reachable"} <= upstream_values or
+                    {"handover_zone", "reachable"} <= upstream_values or
+                    "handover_zone" in upstream_values or
+                    {"recipient", "reachable"} <= affordance_values or
+                    "handover_zone" in affordance_values):
+                return True
+        return False
+
+    # For HANDOVER/FETCH: recipient identified as "user" → the real missing
     # item is the execution pose, not the recipient identity.
     # FETCH: delivery_pose_or_fetch_zone
     # HANDOVER: recipient_pose_or_handover_zone (recipient identified, no pose)
-    # TRANSFER: delivery_pose_or_fetch_zone (generic)
+    # TRANSFER is destination-based and does not fabricate a recipient.
     pose_missing = False
     for role in ("recipient", "support_surface"):
         entity = grounded_roles.get(role)
         if entity is not None and role not in missing_roles and _is_effective_fallback(entity, role):
-            if role == "recipient" and parsed_task.action in (TaskActionKind.FETCH, TaskActionKind.HANDOVER, TaskActionKind.TRANSFER):
+            if role == "recipient" and parsed_task.action in (TaskActionKind.FETCH, TaskActionKind.HANDOVER):
+                if (parsed_task.action == TaskActionKind.HANDOVER and
+                        entity.entity_id == "operator" and
+                        _scene_has_handover_endpoint()):
+                    # The observation supplies a reachable operator endpoint;
+                    # the handover-zone skill provides the pose at runtime.
+                    continue
                 pose_missing = True
                 if parsed_task.action == TaskActionKind.HANDOVER:
                     missing_roles.append("recipient_pose_or_handover_zone")
@@ -3193,7 +4050,6 @@ def build_grounded_task(parsed_task: ParsedTask, scene: Any = None) -> GroundedT
             else:
                 missing_roles.append(role)
 
-    required_clarifications = []
     if pose_missing:
         if parsed_task.action == TaskActionKind.HANDOVER:
             required_clarifications.append("已识别接收者，但缺少可执行的用户位姿或安全交接区域")
@@ -3203,6 +4059,12 @@ def build_grounded_task(parsed_task: ParsedTask, scene: Any = None) -> GroundedT
         required_clarifications.append("缺少放置支撑面或放置区域")
     if "theme" in missing_roles:
         required_clarifications.append("缺少被操作物体")
+
+    # Unresolved scene mentions are not valid grounded roles, even when a
+    # category-only SemanticEntityRef exists in the graph.
+    if parsed_task.theme is not None and not _role_is_grounded(parsed_task.theme) and "theme" not in missing_roles:
+        missing_roles.append("theme")
+        required_clarifications.append("目标实体尚未绑定到唯一感知对象")
 
     grounding_confidence = parsed_task.grounding_confidence
     if scene is not None and parsed_task.theme and parsed_task.theme.entity_id:

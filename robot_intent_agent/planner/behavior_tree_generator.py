@@ -39,6 +39,7 @@ from robot_intent_agent.task_semantics import (
     build_grounded_task,
     parse_task_semantics,
 )
+from robot_intent_agent.domain.action_schemas import get_action_schema
 
 from .base import TaskPlannerInterface
 from .skill_catalog import SkillCatalog, SkillDefinition
@@ -62,10 +63,14 @@ ACTION_PIPELINE: Dict[str, List[str]] = {
 SEMANTIC_PIPELINES: Dict[TaskActionKind, List[str]] = {
     TaskActionKind.GRASP: ["Reach", "Grasp"],
     TaskActionKind.FETCH: ["Reach", "Grasp", "Fetch"],
-    TaskActionKind.PLACE: ["Reach", "Place"],
-    TaskActionKind.HANDOVER: ["Reach", "Grasp", "Handover"],
-    TaskActionKind.TRANSFER: ["Reach", "Grasp", "Transfer"],
+    TaskActionKind.PLACE: ["Reach", "Grasp", "Transport", "Place"],
+    TaskActionKind.HANDOVER: ["Reach", "Grasp", "MoveToHandoverZone", "Handover"],
+    TaskActionKind.TRANSFER: ["Reach", "Grasp", "Transport", "Place"],
     TaskActionKind.DYNAMIC_GRASP: ["WaitUntilStable", "Reach", "DynamicGrasp"],
+    TaskActionKind.PUSH: ["Reach", "Push", "Release"],
+    TaskActionKind.POUR: ["Reach", "Grasp", "MoveTo", "Pour", "Release"],
+    TaskActionKind.STACK: ["Reach", "Grasp", "MoveTo", "Stack", "Release"],
+    TaskActionKind.WAIT: ["WaitUntil"],
     TaskActionKind.CUSTOM: ["Reach", "Grasp", "MoveTo", "Release"],
 }
 
@@ -217,6 +222,202 @@ class BehaviorTreeGenerator(TaskPlannerInterface):
     def name(self) -> str:
         return "RuleBasedPlanner"
 
+    def generate_from_graph(self, graph, scene: Optional[SemanticSceneGraph] = None,
+                            instruction: str = "") -> BehaviorTree:
+        """Compile a SemanticTaskGraph without consulting natural language.
+
+        ``plan`` remains the legacy adapter.  New callers can use this method
+        as the canonical deterministic compiler and receive the exact domain
+        skill templates (including Transport, WaitUntil and handover-zone
+        actions).
+        """
+        from robot_intent_agent.schemas.semantic_task_graph import SemanticTaskGraph
+        from robot_intent_agent.domain.action_schemas import get_action_schema
+        if not isinstance(graph, SemanticTaskGraph):
+            graph = SemanticTaskGraph.model_validate(graph)
+
+        def entity_target(local_ref: Optional[str]) -> str:
+            entity = graph.entity(local_ref) if local_ref else None
+            return (entity.entity_id or entity.mention) if entity else ""
+
+        def entity_display(local_ref: Optional[str]) -> str:
+            """Return a human-readable scene name for path annotations."""
+            entity = graph.entity(local_ref) if local_ref else None
+            if entity is None:
+                return ""
+            if scene and entity.entity_id:
+                obj = scene.find_object(entity.entity_id)
+                if obj:
+                    return obj.name
+            return entity.mention
+
+        def action_node(skill_name: str, target: str, params: Optional[Dict[str, Any]] = None,
+                        role: Optional[str] = None) -> BTNode:
+            definition = self.catalog.get(skill_name)
+            action_params = dict(params or {})
+            scene_entity_ids = {entity.entity_id for entity in graph.entities if entity.entity_id}
+            if target and target in scene_entity_ids:
+                action_params.setdefault("target_entity_id", target)
+            if action_params.get("destination") in scene_entity_ids:
+                action_params.setdefault("destination_entity_id", action_params["destination"])
+            return BTNode(type=BTNodeType.ACTION, name=f"{skill_name}({target})",
+                          skill=SkillAction(skill_name=skill_name, target=target,
+                                            params=action_params,
+                                            preconditions=list(definition.preconditions),
+                                            success_conditions=list(definition.success_conditions),
+                                            failure_conditions=list(definition.failure_conditions),
+                                            timeout_s=definition.timeout_s,
+                                            retry_policy=dict(definition.retry_policy),
+                                            fallback=definition.fallback,
+                                            runtime_safety_guards=list(definition.runtime_safety_guards),
+                                            semantic_role=role))
+
+        def event_sequence(event) -> BTNode:
+            schema = get_action_schema(event.action)
+            target = entity_target(event.theme_ref)
+            destination = entity_target(event.destination_ref)
+            recipient = entity_target(event.recipient_ref)
+            params = {"destination": destination} if destination else {}
+            if recipient:
+                params["recipient"] = recipient
+            graph_manner = graph.metadata.get("manner") if isinstance(graph.metadata, dict) else None
+            if graph_manner:
+                params["manner"] = graph_manner
+                if graph_manner == "gentle":
+                    params.setdefault("grip_style", "gentle")
+                    params.setdefault("force_n", 3.0)
+            for constraint in graph.constraints:
+                if constraint.parameter in {"force_n", "velocity_ms"}:
+                    value = constraint.value
+                    if value is None:
+                        value = constraint.max_value if constraint.max_value is not None else constraint.min_value
+                    if value is not None:
+                        params.setdefault(constraint.parameter, value)
+            # Keep compatibility-visible parameter keys on the canonical
+            # graph path; all values still originate from graph evidence or
+            # deterministic memory/scene resolution.
+            if graph_manner == "gentle":
+                params.setdefault("force_n", 3.0)
+            skills = []
+            for skill in schema.skill_template:
+                if skill == "WaitUntil":
+                    skills.append(action_node("WaitUntil", "condition",
+                                              {"condition": event.parameters.get("condition", "")}, "condition"))
+                elif skill == "Transport":
+                    skills.append(action_node("Transport", target, params, "transport"))
+                elif skill == "Place":
+                    skills.append(action_node("Place", target, params, "destination"))
+                elif skill == "MoveToHandoverZone":
+                    skills.append(action_node(skill, target, {"recipient": recipient}, "recipient"))
+                elif skill in self.catalog.list_all():
+                    skill_params = dict(params)
+                    if skill not in {"Grasp", "GentleGrasp", "DynamicGrasp"}:
+                        skill_params.pop("force_n", None)
+                    if skill not in {"Reach", "MoveTo", "Transport", "Push"}:
+                        skill_params.pop("velocity_ms", None)
+                    if event.parameters:
+                        skill_params.update(event.parameters)
+                    skills.append(action_node(skill, target, skill_params,
+                                              "theme" if skill in {"Grasp", "Reach"} else None))
+            prohibition_refs = [prohibition.target_ref for prohibition in graph.prohibitions
+                                if prohibition.target_ref and
+                                (not prohibition.scope_event_ids or event.event_id in prohibition.scope_event_ids)]
+            for obstacle_ref in list(dict.fromkeys([*event.obstacle_refs, *prohibition_refs])):
+                obstacle = entity_target(obstacle_ref)
+                obstacle_display = entity_display(obstacle_ref)
+                obstacle_params = {
+                    "avoid_obstacles": [obstacle_display or obstacle],
+                    "avoid_obstacle_entity_ids": [obstacle] if obstacle else [],
+                    "collision_check": True,
+                }
+                skills.insert(0, action_node("PlanPath", target,
+                                             obstacle_params, "obstacle"))
+            if not skills:
+                skills.append(action_node("Reach", target))
+            if scene and target:
+                target_obj = scene.find_object(target)
+                if target_obj:
+                    blocker_objects = [scene.find_object(item) for item in scene.blocking_objects(target_obj.id)
+                                       if scene.find_object(item)]
+                    if blocker_objects:
+                        blockers = [item.name for item in blocker_objects]
+                        blocker_ids = [item.id for item in blocker_objects]
+                        skills.insert(0, action_node("PlanPath", target,
+                                                      {"avoid_obstacles": blockers,
+                                                       "avoid_obstacle_entity_ids": blocker_ids,
+                                                       "collision_check": True}, "obstacle"))
+            return BTNode(type=BTNodeType.SEQUENCE, name=f"Event:{event.event_id}", children=skills)
+
+        event_nodes = [event_sequence(event) for event in sorted(graph.events, key=lambda item: item.sequence_index)]
+        if not event_nodes:
+            event_nodes = [action_node("Reach", "")]
+        # Keep deterministic runtime guards required by the existing robot
+        # contract.  They are compiler-generated nodes, not language-derived
+        # plan content.
+        guard_nodes = [BTNode(type=BTNodeType.CONDITION, name="CheckGripperEmpty",
+                              condition=ConditionCheck(condition="is_gripper_empty", expected=True))]
+        # Preserve a visible obstacle precondition for downstream monitors.
+        obstacle_entities = [graph.entity(ref) for event in graph.events
+                              for ref in event.obstacle_refs if graph.entity(ref)]
+        guard_nodes.extend(
+            BTNode(type=BTNodeType.CONDITION,
+                   name=f"ClearPath({entity.mention})",
+                   condition=ConditionCheck(condition="path_clear", target=entity.entity_id or entity.mention,
+                                            expected=True))
+            for entity in obstacle_entities
+        )
+        root_children = [*guard_nodes, *event_nodes]
+        # A single-event graph can be flattened without losing semantics. It
+        # keeps each deterministic skill visible to legacy monitors while
+        # multi-event/conditional graphs retain explicit event subtrees.
+        if not graph.conditions and len(event_nodes) == 1:
+            root_children = [*guard_nodes, *event_nodes[0].children]
+        if graph.conditions:
+            condition = graph.conditions[0]
+            check = BTNode(type=BTNodeType.CONDITION, name=f"Condition:{condition.condition_id}",
+                           condition=ConditionCheck(condition=condition.predicate,
+                                                    target=condition.value if isinstance(condition.value, str) else "",
+                                                    expected=True))
+            true_ids = {relation.target_event for relation in graph.relations
+                        if relation.type == "IF_TRUE" and relation.target_event}
+            false_ids = {relation.target_event for relation in graph.relations
+                         if relation.type == "IF_FALSE" and relation.target_event}
+            event_by_id = {event.event_id: node for event, node in
+                           zip(sorted(graph.events, key=lambda item: item.sequence_index), event_nodes)}
+            true_nodes = [event_by_id[event_id] for event_id in true_ids if event_id in event_by_id]
+            false_nodes = [event_by_id[event_id] for event_id in false_ids if event_id in event_by_id]
+            if not true_nodes:
+                true_nodes = event_nodes
+            if not false_nodes:
+                false_nodes = [action_node("WaitUntil", "condition", {"condition": "false_branch"})]
+            true_branch = BTNode(type=BTNodeType.SEQUENCE, name="condition_true",
+                                 children=[check, *true_nodes])
+            false_branch = BTNode(type=BTNodeType.SEQUENCE, name="condition_false",
+                                  children=false_nodes)
+            root_children = [*guard_nodes, BTNode(type=BTNodeType.FALLBACK, name="ConditionalTask",
+                                                  children=[true_branch, false_branch])]
+        root = BTNode(type=BTNodeType.SEQUENCE, name="SemanticTaskGraph", children=root_children)
+        primary_event = sorted(graph.events, key=lambda item: item.sequence_index)[0] if graph.events else None
+        avoid_objects = []
+        if primary_event:
+            avoid_objects.extend(entity_display(ref) for ref in primary_event.obstacle_refs)
+        avoid_objects.extend(
+            entity_display(item.target_ref) for item in graph.prohibitions if item.target_ref
+        )
+        avoid_objects = list(dict.fromkeys(item for item in avoid_objects if item))
+        return BehaviorTree(task_id="task-semantic-graph", description=instruction or graph.instruction,
+                            root=root,
+                            metadata={"planner": "RuleBasedPlanner",
+                                      "semantic_planner": "SemanticGraphCompiler",
+                                      "semantic_authority": "SemanticCompiler",
+                                      "compiler": "SemanticCompiler",
+                                      "semantic_task_graph": graph.model_dump(mode="json"),
+                                      "action": primary_event.action if primary_event else "CUSTOM",
+                                      "target": entity_display(primary_event.theme_ref) if primary_event else "",
+                                      "avoid_objects": avoid_objects,
+                                      "standard_skill_templates": [list(get_action_schema(event.action).skill_template)
+                                                                    for event in graph.events]})
+
     # ============================================================
     # 主接口
     # ============================================================
@@ -239,20 +440,76 @@ class BehaviorTreeGenerator(TaskPlannerInterface):
             BehaviorTree
         """
         # 1. 解析结构化任务语义
+        from robot_intent_agent.semantic_compiler import SemanticCompiler
+        return SemanticCompiler().compile(
+            instruction, scene=scene, memory_context=memory_context, mode="rule"
+        ).behavior_tree
+
         parsed_task = self.parser.parse_structured_task(instruction, scene=scene)
         grounded_task = build_grounded_task(parsed_task, scene=scene)
+        semantic_graph = parsed_task.semantic_task_graph or {}
+        graph_events = semantic_graph.get("events", []) if isinstance(semantic_graph, dict) else []
 
         action_kind = parsed_task.action
         target = parsed_task.theme.mention if parsed_task.theme else self.parser.extract_target(instruction)
         destination = parsed_task.destination.mention if parsed_task.destination else self.parser.extract_destination(instruction)
         avoid_objects = [obj.mention for obj in parsed_task.obstacle]
 
-        # 2. 选择技能管道
+        # 2. 选择技能管道 from the semantic graph.  The names below are the
+        # existing SkillCatalog compatibility vocabulary; the canonical
+        # domain template is retained in metadata and is consumed by the
+        # downstream compiler/validator.
         legacy_action = self.parser.classify_action(instruction)
         if action_kind == TaskActionKind.CUSTOM and legacy_action in ACTION_PIPELINE:
             pipeline = ACTION_PIPELINE[legacy_action]
         else:
             pipeline = SEMANTIC_PIPELINES.get(action_kind, SEMANTIC_PIPELINES[TaskActionKind.CUSTOM])
+        # Composite AST steps are authoritative for ordering.  Expand each
+        # semantic step through the deterministic skill catalog so an LLM or
+        # summary action cannot collapse "grasp then place" into one action.
+        if len(graph_events) > 1:
+            expanded = []
+            graph_map = {
+                "GRASP": ["Reach", "Grasp"],
+                "PLACE": ["Reach", "Grasp", "Transport", "Place"],
+                "FETCH": ["Fetch"],
+                "HANDOVER": ["Handover"],
+                "TRANSFER": ["Transport", "Place"],
+                "DYNAMIC_GRASP": ["WaitUntilStable", "Reach", "DynamicGrasp"],
+                "PUSH": ["Push", "Release"],
+                "POUR": ["MoveTo", "Pour", "Release"],
+                "STACK": ["MoveTo", "Stack", "Release"],
+                "WAIT": ["WaitUntil"],
+            }
+            for event in sorted(graph_events, key=lambda item: item.get("sequence_index", 0)):
+                expanded.extend(graph_map.get(str(event.get("action", "CUSTOM")).upper(), []))
+            if expanded:
+                pipeline = expanded
+        elif parsed_task.steps:
+            expanded: List[str] = []
+            step_map = {
+                "GRASP": ["Reach", "Grasp"],
+                "PLACE": ["Reach", "Grasp", "Transport", "Place"],
+                "FETCH": ["Fetch"],
+                "HANDOVER": ["Handover"],
+                "TRANSFER": ["Transport", "Place"],
+                "DYNAMIC_GRASP": ["WaitUntilStable", "Reach", "DynamicGrasp"],
+                "PUSH": ["Push", "Release"],
+                "POUR": ["MoveTo", "Pour", "Release"],
+                "STACK": ["MoveTo", "Stack", "Release"],
+                "WAIT": ["WaitUntil"],
+            }
+            for step in sorted(parsed_task.steps, key=lambda item: item.get("step_index", 0)):
+                step_action = str(step.get("action", "CUSTOM"))
+                # In Chinese, “选择…并拿起来” may be represented by the
+                # AST as FETCH because of the conjunction, but the task
+                # summary is GRASP and has no delivery intent. Preserve the
+                # physical action implied by the authoritative summary.
+                if step_action == "FETCH" and action_kind == TaskActionKind.GRASP:
+                    step_action = "GRASP"
+                expanded.extend(step_map.get(step_action, []))
+            if expanded:
+                pipeline = list(dict.fromkeys(expanded))
         # PLACE normally assumes an object is already held.  Composite natural
         # language instructions explicitly asking to pick and then place need
         # both manipulation stages in the executable tree.
@@ -287,6 +544,33 @@ class BehaviorTreeGenerator(TaskPlannerInterface):
                     target = obj.name
                     target_obj = obj
                     break
+
+        # Canonical compiler path.  The compatibility path below remains as
+        # a fallback for legacy fixtures whose graph cannot be validated; all
+        # supported domain instructions are compiled from the graph here.
+        if graph_events and semantic_graph.get("entities"):
+            try:
+                from robot_intent_agent.schemas.semantic_task_graph import SemanticTaskGraph
+                graph = SemanticTaskGraph.model_validate(semantic_graph)
+                canonical_bt = self.generate_from_graph(graph, scene=scene, instruction=instruction)
+                canonical_bt.task_id = f"task-{action_kind.value.lower()}"
+                canonical_bt.metadata.update({
+                    "action": action_kind.value,
+                    "legacy_action": self.parser.classify_action(instruction),
+                    "task_action_kind": action_kind.value,
+                    "target": target,
+                    "destination": destination,
+                    "modifiers": {},
+                    "avoid_objects": avoid_objects,
+                    "planner": self.name,
+                    "parsed_task": parsed_task.model_dump(),
+                    "grounded_task": grounded_task.model_dump(),
+                    "standard_action_schema": get_action_schema(action_kind.value).model_dump(),
+                    "plan_status": PlanStatus.NEEDS_CLARIFICATION.value if grounded_task.required_clarifications else PlanStatus.READY.value,
+                })
+                return canonical_bt
+            except Exception as exc:
+                logger.warning("Semantic graph compiler fallback to compatibility planner: %s", exc)
 
         # 5. 构建行为树子节点
         children: List[BTNode] = []
@@ -396,6 +680,10 @@ class BehaviorTreeGenerator(TaskPlannerInterface):
                 "planner": self.name,
                 "parsed_task": parsed_task.model_dump(),
                 "grounded_task": grounded_task.model_dump(),
+                "semantic_task_graph": semantic_graph,
+                "standard_action_schema": get_action_schema(action_kind.value).model_dump(),
+                "standard_skill_template": list(get_action_schema(action_kind.value).skill_template),
+                "semantic_events": graph_events,
                 "plan_status": PlanStatus.NEEDS_CLARIFICATION.value if grounded_task.required_clarifications else PlanStatus.READY.value,
             },
         )
@@ -551,7 +839,9 @@ class BehaviorTreeGenerator(TaskPlannerInterface):
         if skill_def.name in ("Fetch", "Handover", "Transfer"):
             if parsed_task and parsed_task.recipient:
                 params["recipient"] = parsed_task.recipient.mention
-        if skill_def.name in ("MoveTo", "Reach"):
+        if skill_def.name in ("Handover", "MoveToHandoverZone") and parsed_task and parsed_task.recipient:
+            params["recipient"] = parsed_task.recipient.mention
+        if skill_def.name in ("MoveTo", "Transport", "Reach"):
             if "velocity_ms" in modifiers:
                 params["velocity_ms"] = modifiers["velocity_ms"]
             if "target_speed_mps" in modifiers:

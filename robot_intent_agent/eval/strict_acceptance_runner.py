@@ -90,7 +90,11 @@ def score_output(case: dict[str, Any], r: dict[str, Any]) -> tuple[bool, list[st
     if pt:
         referenced += [_entity_id(pt.source), _entity_id(pt.recipient)]
         referenced += [_entity_id(x) for x in (pt.obstacle or [])]
-    fabricated = sorted({x for x in referenced if x and x not in known_ids and x != "user"})
+    # ``operator`` is the stable symbolic recipient identity emitted by the
+    # handover contract; it is not a perception object and must not be
+    # mistaken for a fabricated scene ID.  Physical entity IDs still must be
+    # present in the observation whitelist.
+    fabricated = sorted({x for x in referenced if x and x not in known_ids and x not in {"user", "operator"}})
     if fabricated: reasons.append(f"FABRICATED_IDS:{fabricated}")
 
     skills = list(r.get("actions", []))
@@ -133,10 +137,11 @@ def score_output(case: dict[str, Any], r: dict[str, Any]) -> tuple[bool, list[st
     }
 
 
-def run(mode: str, limit: int | None = None, dataset_path: str | None = None):
+def run(mode: str, limit: int | None = None, dataset_path: str | None = None,
+        start: int = 0, output_suffix: str = ""):
     dataset = Path(dataset_path) if dataset_path else DATASET
     data = json.loads(dataset.read_text(encoding="utf-8"))
-    cases = data["cases"][:limit]
+    cases = data["cases"][start:start + limit if limit is not None else None]
     invalid = {c["case_id"]: audit_case(c) for c in cases if audit_case(c)}
     if invalid:
         raise SystemExit(f"Dataset audit failed for {len(invalid)} cases: {list(invalid.items())[:3]}")
@@ -191,7 +196,8 @@ def run(mode: str, limit: int | None = None, dataset_path: str | None = None):
         "by_difficulty": {k: {"total": v[0], "passed": v[1], "rate": round(v[1]/v[0], 4)} for k,v in by_difficulty.items()},
         "by_category": {k: {"total": v[0], "passed": v[1], "rate": round(v[1]/v[0], 4)} for k,v in by_category.items()},
     }
-    out = HERE / f"{dataset.stem}_{mode}_results.json"
+    suffix = f"_{output_suffix}" if output_suffix else ""
+    out = HERE / f"{dataset.stem}_{mode}_results{suffix}.json"
     out.write_text(json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return summary
@@ -201,6 +207,8 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=("rule", "hybrid"), required=True)
     p.add_argument("--limit", type=int)
+    p.add_argument("--start", type=int, default=0)
+    p.add_argument("--output-suffix", default="")
     p.add_argument("--dataset")
     args = p.parse_args()
-    run(args.mode, args.limit, args.dataset)
+    run(args.mode, args.limit, args.dataset, args.start, args.output_suffix)

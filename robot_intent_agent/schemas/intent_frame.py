@@ -33,6 +33,10 @@ class ActionKind(str, Enum):
     HANDOVER = "HANDOVER"
     TRANSFER = "TRANSFER"
     DYNAMIC_GRASP = "DYNAMIC_GRASP"
+    PUSH = "PUSH"
+    POUR = "POUR"
+    STACK = "STACK"
+    WAIT = "WAIT"
     CUSTOM = "CUSTOM"
 
 
@@ -65,6 +69,8 @@ class ConditionPredicate(str, Enum):
     ROBOT_HOMED = "ROBOT_HOMED"
     DISTANCE_LESS_THAN = "DISTANCE_LESS_THAN"
     DISTANCE_GREATER_THAN = "DISTANCE_GREATER_THAN"
+    WAIT_UNTIL = "WAIT_UNTIL"
+    TIMER = "TIMER"
     CUSTOM = "CUSTOM"
 
 
@@ -185,6 +191,8 @@ class Condition(BaseModel):
         description="Actions that MUST execute after this condition is satisfied")
     on_true: Optional[ActionKind] = Field(default=None, description="Action when condition is true")
     on_false: Optional[ActionKind] = Field(default=None, description="Action when condition is false")
+    on_true_subject: Optional[EntityReference] = Field(default=None, description="Entity used by true branch")
+    on_false_subject: Optional[EntityReference] = Field(default=None, description="Entity used by false branch")
     hard: bool = Field(default=True, description="If True, condition MUST be satisfied before proceeding")
     source_text_span: str = Field(default="")
 

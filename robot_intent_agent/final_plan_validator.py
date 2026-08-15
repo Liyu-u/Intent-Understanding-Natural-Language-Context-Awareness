@@ -29,14 +29,14 @@ from robot_intent_agent.task_semantics import (
 
 # Per-stage velocity hard limits (m/s)
 STAGE_VELOCITY_LIMITS: Dict[str, float] = {
-    "Reach": 0.2, "MoveTo": 0.2, "TransportToPreHandoverPose": 0.2,
+    "Reach": 0.2, "MoveTo": 0.2, "Transport": 0.2, "TransportToPreHandoverPose": 0.2,
     "ApproachHandoverZone": 0.1, "ControlledHandover": 0.1, "VerifyTransfer": 0.1,
     "Retract": 0.2, "Grasp": 0.0, "DynamicGrasp": 0.0,
     "Place": 0.0, "Handover": 0.1, "Fetch": 0.2,
 }
 
 HANDOVER_MOTION_ACTIONS = {
-    "Reach", "MoveTo", "TransportToPreHandoverPose", "ApproachHandoverZone",
+    "Reach", "MoveTo", "Transport", "TransportToPreHandoverPose", "ApproachHandoverZone",
     "ControlledHandover", "VerifyTransfer", "Retract", "Handover", "Fetch",
 }
 
@@ -132,9 +132,12 @@ class FinalPlanValidator:
 
         # ── SEMANTIC: action/role consistency ──
         self._validate_action_consistency(parsed_task, behavior_tree, issues)
+        self._validate_action_schema_contract(parsed_task, behavior_tree, scene, issues)
+        self._validate_bt_action_contract(parsed_task, behavior_tree, issues)
         self._validate_role_completeness(parsed_task, issues)
         self._validate_role_non_conflict(parsed_task, scene, issues)
         self._validate_condition_completeness(parsed_task, issues)
+        self._validate_unresolved_ambiguity(parsed_task, issues)
 
         # ── CROSS_FIELD: cross-structure consistency ──
         self._validate_missing_roles_vs_status(parsed_task, resolution, behavior_tree, issues)
@@ -145,7 +148,12 @@ class FinalPlanValidator:
         self._validate_numeric_constraints(parsed_task, resolution, issues)
         self._validate_per_skill_velocity(behavior_tree, issues)
         self._validate_force_velocity_bounds(parsed_task, resolution, issues)
-        self._validate_explicit_conflicts(parsed_task, constraint_graph, issues)
+        self._validate_explicit_conflicts(
+            parsed_task,
+            constraint_graph,
+            issues,
+            semantic_authority=behavior_tree.metadata.get("semantic_authority") == "SemanticCompiler",
+        )
         self._validate_dynamic_behavior(parsed_task, behavior_tree, issues)
         self._validate_obstacle_passing(parsed_task, behavior_tree, constraint_graph, issues)
 
@@ -169,15 +177,18 @@ class FinalPlanValidator:
         has_condition_issue = any(
             "CONDITIONAL_BRANCH_LOST" in i.code or "CONDITION_STATE_UNKNOWN" in i.code
             for i in issues)
+        has_ambiguity_issue = any("AMBIGUITY" in i.code for i in issues)
+        has_schema_role_issue = any("MISSING_ACTION_SCHEMA_ROLE" in i.code for i in issues)
+        has_graph_issue = any("SEMANTIC_GRAPH" in i.code or "UNKNOWN_" in i.code for i in issues)
 
         execution_allowed = not has_critical and resolution.plan_status in self.DISPATCHABLE_STATUSES
 
         # Status priority: BLOCKED > NEEDS_CLARIFICATION > READY_WITH_SAFE_SUBSTITUTION > READY
-        if has_negation_issue:
+        if has_negation_issue or has_graph_issue:
             status = PlanStatus.BLOCKED
         elif execution_allowed:
             status = resolution.plan_status
-        elif has_grounding_issue or has_condition_issue:
+        elif has_grounding_issue or has_condition_issue or has_schema_role_issue or has_ambiguity_issue:
             status = PlanStatus.NEEDS_CLARIFICATION
         else:
             status = PlanStatus.BLOCKED
@@ -188,9 +199,11 @@ class FinalPlanValidator:
             issues=issues,
         )
 
-    def _validate_explicit_conflicts(self, parsed_task, constraint_graph, issues):
+    def _validate_explicit_conflicts(
+        self, parsed_task, constraint_graph, issues, semantic_authority: bool = False
+    ):
         """Fail closed on explicit action and numeric contradictions."""
-        text = parsed_task.instruction or ""
+        text = "" if semantic_authority else (parsed_task.instruction or "")
         if re.search(r"(?:同时|但|又|并且)\s*(?:不要|别|禁止)\s*(?:抓取|抓|拿起|拿|移动|放置)", text):
             issues.append(_issue(
                 ErrorCategory.SEMANTIC, ErrorCode.SELF_CONTRADICTORY_ACTION,
@@ -198,7 +211,17 @@ class FinalPlanValidator:
                 severity="error", subject="action",
             ))
         conflicts = (getattr(constraint_graph, "metadata", {}) or {}).get("conflicts", [])
+        # A user exact request outside an object hard limit is a safe
+        # substitution, not an internal contradiction.  Only graph conflicts
+        # that do not correspond to a resolvable substitution are vetoes.
+        resolution = getattr(constraint_graph, "metadata", {}).get("constraint_resolution", {}) if getattr(constraint_graph, "metadata", None) else {}
+        substitution_parameters = {
+            name for name, value in (resolution.get("parameters", {}) or {}).items()
+            if isinstance(value, dict) and value.get("substitution_reason")
+        }
         for conflict in conflicts:
+            if substitution_parameters and any(name in str(conflict) for name in substitution_parameters):
+                continue
             issues.append(_issue(
                 ErrorCategory.CONSTRAINT, ErrorCode.NUMERIC_CONSTRAINT_CONFLICT,
                 str(conflict), severity="error", subject="constraint",
@@ -225,6 +248,27 @@ class FinalPlanValidator:
                     f"Contradictory {parameter} bounds: minimum {max(lower_bounds)} "
                     f"exceeds maximum {min(upper_bounds)}.",
                     severity="error", subject=parameter,
+                ))
+        # Keep the safety invariant independent of the numeric parser's
+        # surface coverage.  The semantic compiler may preserve only one
+        # bound when a conjunction is written as “at least 5N and no more
+        # than 2N”; the raw instruction still proves the contradiction.
+        if re.search(
+            r"(?:至少|不低于|不小于|最少|>=|≥)\s*\d+(?:\.\d+)?\s*(?:N|牛顿?)"
+            r".*?(?:不超过|不大于|最多|至多|<=|≤)\s*\d+(?:\.\d+)?\s*(?:N|牛顿?)",
+            text,
+            re.IGNORECASE,
+        ):
+            bounds = [float(value) for value in re.findall(
+                r"(?:至少|不低于|不小于|最少|>=|≥|不超过|不大于|最多|至多|<=|≤)\s*(\d+(?:\.\d+)?)",
+                text,
+                re.IGNORECASE,
+            )]
+            if len(bounds) >= 2:
+                issues.append(_issue(
+                    ErrorCategory.CONSTRAINT, ErrorCode.NUMERIC_CONSTRAINT_CONFLICT,
+                    f"Contradictory force_n bounds in instruction: lower {bounds[0]} exceeds upper {bounds[1]}.",
+                    severity="error", subject="force_n",
                 ))
 
     # ══════════════════════════════════════════════════════════
@@ -301,19 +345,28 @@ class FinalPlanValidator:
                         subject="MoveTo"))
 
     def _validate_required_roles(self, parsed_task, scene, issues):
-        if parsed_task.theme is None:
+        if parsed_task.theme is None and parsed_task.action != TaskActionKind.WAIT:
             issues.append(_issue(ErrorCategory.GROUNDING, "MISSING_THEME",
                 "Task theme is not grounded", subject="theme"))
 
-        if parsed_task.action in (TaskActionKind.FETCH, TaskActionKind.HANDOVER, TaskActionKind.TRANSFER):
+        if parsed_task.action == TaskActionKind.HANDOVER:
             if parsed_task.recipient is None or parsed_task.recipient.entity_id is None:
                 issues.append(_issue(ErrorCategory.GROUNDING, "MISSING_RECIPIENT",
                     "Recipient identity is missing", subject="recipient"))
             elif parsed_task.recipient.entity_id == "user":
-                code = "MISSING_RECIPIENT_POSE" if parsed_task.action == TaskActionKind.HANDOVER else "MISSING_DELIVERY_POSE"
-                label = "recipient_pose_or_handover_zone" if parsed_task.action == TaskActionKind.HANDOVER else "delivery_pose_or_fetch_zone"
+                code = "MISSING_RECIPIENT_POSE"
                 issues.append(_issue(ErrorCategory.GROUNDING, code,
-                    f"Recipient identified but no executable {label} available", subject=label))
+                    "Recipient identified but no executable recipient_pose_or_handover_zone available",
+                    subject="recipient_pose_or_handover_zone"))
+        elif parsed_task.action in (TaskActionKind.FETCH, TaskActionKind.TRANSFER):
+            if (parsed_task.action == TaskActionKind.FETCH and
+                    (parsed_task.destination is None or parsed_task.destination.entity_id is None) and
+                    (parsed_task.recipient is None or parsed_task.recipient.entity_id is None)):
+                issues.append(_issue(ErrorCategory.GROUNDING, "MISSING_DELIVERY_POSE",
+                    "Fetch task has neither a grounded destination nor a recipient", subject="delivery_pose_or_recipient"))
+            elif parsed_task.destination is None or parsed_task.destination.entity_id is None:
+                issues.append(_issue(ErrorCategory.GROUNDING, "MISSING_DESTINATION",
+                    "Destination identity is missing", subject="destination"))
 
         if parsed_task.action == TaskActionKind.PLACE:
             if parsed_task.support_surface is None:
@@ -343,6 +396,37 @@ class FinalPlanValidator:
                                 f"for theme of same class — cannot place on same-type non-support object",
                                 subject="support_surface"))
 
+    def _validate_action_schema_contract(self, parsed_task, behavior_tree, scene, issues):
+        """Enforce the domain action contract before execution is allowed."""
+        from robot_intent_agent.domain.action_schemas import get_action_schema
+        schema = get_action_schema(parsed_task.action.value if hasattr(parsed_task.action, "value") else parsed_task.action)
+        roles = {name for name, value in parsed_task.role_map().items() if value is not None}
+        # WAIT requires a condition atom rather than a scene entity role.
+        if getattr(parsed_task, "conditions", None):
+            roles.add("condition")
+        missing = schema.missing_roles(roles)
+        for role in missing:
+            code = "MISSING_ACTION_SCHEMA_ROLE"
+            issues.append(_issue(ErrorCategory.SEMANTIC, code,
+                                 f"Action {schema.action} requires role '{role}'", severity="warning", subject=role))
+        for role in schema.forbidden_roles:
+            if role in roles:
+                issues.append(_issue(ErrorCategory.SEMANTIC, "FORBIDDEN_ACTION_SCHEMA_ROLE",
+                                     f"Action {schema.action} forbids role '{role}'", subject=role))
+        # Explicitly reject any graph event whose local references do not
+        # resolve; this catches accidental LLM-only entities early.
+        graph = getattr(parsed_task, "semantic_task_graph", None)
+        if isinstance(graph, dict):
+            try:
+                from robot_intent_agent.schemas.semantic_task_graph import SemanticTaskGraph
+                graph_errors = SemanticTaskGraph.model_validate(graph).validate_local_references()
+                for error in graph_errors:
+                    issues.append(_issue(ErrorCategory.SEMANTIC, "SEMANTIC_GRAPH_REFERENCE_INVALID",
+                                         error, subject="semantic_task_graph"))
+            except Exception as exc:
+                issues.append(_issue(ErrorCategory.SCHEMA, "SEMANTIC_GRAPH_INVALID",
+                                     f"SemanticTaskGraph validation failed: {exc}", subject="semantic_task_graph"))
+
     def _validate_entity_ids_in_scene(self, behavior_tree, scene, issues):
         """Every entity_id in BT actions must exist in the scene (or be 'user')."""
         if not scene:
@@ -351,7 +435,7 @@ class FinalPlanValidator:
         for action in behavior_tree.root.flatten_actions():
             for key in ("target_entity_id", "destination_entity_id"):
                 eid = action.params.get(key, "")
-                if eid and eid not in scene_ids and eid != "user":
+                if eid and eid not in scene_ids and eid not in {"user", "operator"}:
                     issues.append(_issue(ErrorCategory.GROUNDING, "BT_ENTITY_NOT_IN_SCENE",
                         f"BT action '{action.skill_name}' {key}='{eid}' not found in scene objects",
                         subject=action.skill_name))
@@ -386,8 +470,17 @@ class FinalPlanValidator:
                     bt_avoids.add(av)
 
         all_avoids = cg_avoids | bt_avoids | avoid_eids
-        for mention in avoid_mentions:
-            if mention and mention not in all_avoids and not any(mention in a for a in all_avoids):
+        for obstacle in parsed_task.obstacle:
+            mention = obstacle.mention
+            # The canonical downstream representation is the grounded scene
+            # ID.  A localized display name is optional in BT params, so a
+            # Chinese mention must not be treated as “lost” merely because
+            # the constraint graph stores D_obs_* and BT stores the scene
+            # label.  Accept either the ID or a display-name occurrence.
+            grounded = obstacle.entity_id and obstacle.entity_id in all_avoids
+            display_match = mention and any(mention in str(value) or str(value) in mention
+                                            for value in all_avoids)
+            if mention and not grounded and not display_match:
                 issues.append(_issue(ErrorCategory.GROUNDING, "AVOID_NOT_PROPAGATED",
                     f"Avoid object '{mention}' not found in CG collision_avoid or BT avoid params",
                     subject="obstacle"))
@@ -457,7 +550,7 @@ class FinalPlanValidator:
 
         # Check theme: if theme is present but not grounded to scene
         if parsed_task.theme and parsed_task.theme.entity_id:
-            if parsed_task.theme.entity_id not in scene_ids and parsed_task.theme.entity_id != "user":
+            if parsed_task.theme.entity_id not in scene_ids and parsed_task.theme.entity_id not in {"user", "operator"}:
                 issues.append(_issue(ErrorCategory.GROUNDING, ErrorCode.ROLE_MENTION_NOT_GROUNDED,
                     f"Theme '{parsed_task.theme.mention}' has entity_id={parsed_task.theme.entity_id} "
                     f"not found in scene objects. Grounding failed.",
@@ -473,7 +566,7 @@ class FinalPlanValidator:
 
         # Check destination
         if parsed_task.destination and parsed_task.destination.entity_id:
-            if parsed_task.destination.entity_id not in scene_ids and parsed_task.destination.entity_id != "user":
+            if parsed_task.destination.entity_id not in scene_ids and parsed_task.destination.entity_id not in {"user", "operator"}:
                 issues.append(_issue(ErrorCategory.GROUNDING, ErrorCode.ROLE_MENTION_NOT_GROUNDED,
                     f"Destination '{parsed_task.destination.mention}' "
                     f"entity_id={parsed_task.destination.entity_id} not in scene.",
@@ -482,6 +575,18 @@ class FinalPlanValidator:
     # ══════════════════════════════════════════════════════════
     # Phase 7: Condition completeness
     # ══════════════════════════════════════════════════════════
+
+    def _validate_unresolved_ambiguity(self, parsed_task, issues):
+        """An explicit unresolved ambiguity must never be executable."""
+        for item in getattr(parsed_task, "ambiguity_resolution", []) or []:
+            if isinstance(item, dict) and str(item.get("status", "")).upper() == "UNRESOLVED":
+                issues.append(_issue(
+                    ErrorCategory.SEMANTIC,
+                    "UNRESOLVED_AMBIGUITY",
+                    item.get("clarification") or "An intent ambiguity requires clarification",
+                    severity="error",
+                    subject=item.get("ambiguity_id", "ambiguity"),
+                ))
 
     def _validate_condition_completeness(self, parsed_task, issues):
         """Conditional structures must preserve branches; unknown state → not READY."""
@@ -555,7 +660,7 @@ class FinalPlanValidator:
                     severity="error", subject=action.skill_name))
 
             # If target_entity_id exists but not in scene
-            if target_eid and target_eid not in scene_ids and target_eid != "user":
+            if target_eid and target_eid not in scene_ids and target_eid not in {"user", "operator"}:
                 issues.append(_issue(ErrorCategory.GROUNDING, ErrorCode.ENTITY_ID_NOT_IN_SCENE,
                     f"BT action '{action.skill_name}' target_entity_id='{target_eid}' "
                     f"not found in scene objects.",
@@ -566,7 +671,7 @@ class FinalPlanValidator:
             for role_name in ("theme", "destination", "support_surface", "recipient"):
                 entity = getattr(parsed_task, role_name, None)
                 if entity and hasattr(entity, 'entity_id') and entity.entity_id:
-                    if entity.entity_id not in scene_ids and entity.entity_id != "user":
+                    if entity.entity_id not in scene_ids and entity.entity_id not in {"user", "operator"}:
                         issues.append(_issue(ErrorCategory.GROUNDING, ErrorCode.ENTITY_ID_NOT_IN_SCENE,
                             f"Role '{role_name}' references entity_id='{entity.entity_id}' "
                             f"not found in scene.",
@@ -611,11 +716,19 @@ class FinalPlanValidator:
 
     def _validate_role_completeness(self, parsed_task, issues):
         """Verify that action-required roles have been extracted."""
-        if parsed_task.action in (TaskActionKind.FETCH, TaskActionKind.HANDOVER, TaskActionKind.TRANSFER):
+        # TRANSFER is a destination-based manipulation action.  It must not
+        # inherit the recipient requirement of FETCH/HANDOVER; that old check
+        # was the reason every valid "搬运到/移送到" case was blocked after
+        # semantic parsing had already produced theme + destination.
+        if parsed_task.action == TaskActionKind.HANDOVER:
             if not parsed_task.recipient:
                 issues.append(_issue(ErrorCategory.SEMANTIC, "RECIPIENT_NOT_EXTRACTED",
                     f"Action {parsed_task.action.value} requires a recipient but none was extracted",
                     subject="recipient"))
+        if parsed_task.action == TaskActionKind.FETCH:
+            if not parsed_task.destination and not parsed_task.recipient:
+                issues.append(_issue(ErrorCategory.SEMANTIC, "DELIVERY_ROLE_NOT_EXTRACTED",
+                    "FETCH action requires a destination or recipient", subject="destination_or_recipient"))
         if parsed_task.action == TaskActionKind.PLACE:
             if not parsed_task.support_surface and not parsed_task.destination:
                 issues.append(_issue(ErrorCategory.SEMANTIC, "DESTINATION_NOT_EXTRACTED",
@@ -636,7 +749,8 @@ class FinalPlanValidator:
                     subject="plan_status"))
 
         # Check for theme missing but execution allowed
-        if parsed_task.theme is None and resolution.plan_status in self.DISPATCHABLE_STATUSES:
+        if (parsed_task.theme is None and parsed_task.action != TaskActionKind.WAIT
+                and resolution.plan_status in self.DISPATCHABLE_STATUSES):
             issues.append(_issue(ErrorCategory.CROSS_FIELD, "NO_THEME_BUT_DISPATCHABLE",
                 "Theme missing but plan_status is dispatchable",
                 subject="plan_status"))
@@ -662,12 +776,12 @@ class FinalPlanValidator:
                 if isinstance(action_force, dict):
                     action_force = action_force.get("value")
                 if action_force is not None and abs(float(action_force) - float(final_force)) > 0.01:
-                    issues.append(_issue(ErrorCategory.CROSS_FIELD, "BT_IR_FORCE_MISMATCH",
+                    issues.append(_issue(ErrorCategory.CROSS_FIELD, "FORCE_MISMATCH",
                         f"BT force ({action_force}) differs from IR resolution ({final_force})",
                         subject=action.skill_name))
 
             # Velocity consistency
-            if action.skill_name in ("Reach", "MoveTo", "Push") and final_velocity is not None:
+            if action.skill_name in ("Reach", "MoveTo", "Transport", "Push") and final_velocity is not None:
                 action_velocity = action.params.get("velocity_ms")
                 if isinstance(action_velocity, dict):
                     action_velocity = action_velocity.get("value")
@@ -696,6 +810,57 @@ class FinalPlanValidator:
             issues.append(_issue(ErrorCategory.CROSS_FIELD, "CG_NO_RESOLUTION",
                 f"ConstraintGraph has {cg_constraints} nodes but resolution has 0 parameters",
                 severity="warning", subject="constraint_resolution"))
+
+    def _validate_bt_action_contract(self, parsed_task, behavior_tree, issues):
+        """Ensure the deterministic BT contains the executable action implied by IR.
+
+        This is intentionally action-family based rather than case based.  It
+        catches semantic/BT drift after LLM fusion while allowing the planner
+        to insert auxiliary navigation and safety nodes.
+        """
+        actions = [a.skill_name for a in behavior_tree.root.flatten_actions()]
+        if not actions:
+            issues.append(_issue(ErrorCategory.CROSS_FIELD, "EMPTY_BEHAVIOR_TREE",
+                "Parsed task has no executable behavior-tree action", subject="behavior_tree"))
+            return
+
+        required = {
+            TaskActionKind.GRASP: {"Grasp", "GentleGrasp", "DynamicGrasp"},
+            TaskActionKind.DYNAMIC_GRASP: {"DynamicGrasp"},
+            TaskActionKind.PLACE: {"Place", "Transport"},
+            TaskActionKind.HANDOVER: {"Handover", "ControlledHandover", "MoveToHandoverZone"},
+            TaskActionKind.FETCH: {"Fetch", "Grasp", "GentleGrasp", "DynamicGrasp"},
+            TaskActionKind.TRANSFER: {"Transfer", "MoveTo", "Transport", "TransportToPreHandoverPose"},
+        }.get(parsed_task.action)
+        if required and not any(name in required for name in actions):
+            issues.append(_issue(ErrorCategory.CROSS_FIELD, "BT_ACTION_MISSING",
+                f"IR action {parsed_task.action.value} has no matching BT skill; got {actions}",
+                severity="error", subject=parsed_task.action.value))
+
+        # Composite tasks must preserve the declared high-level order.  The
+        # BT may contain navigation/safety nodes between these milestones.
+        steps = getattr(parsed_task, "steps", None) or []
+        if len(steps) > 1:
+            skill_by_action = {
+                "GRASP": {"Grasp", "GentleGrasp", "DynamicGrasp"},
+                "PLACE": {"Place", "Transport"}, "HANDOVER": {"Handover", "ControlledHandover", "MoveToHandoverZone"},
+                "FETCH": {"Fetch", "Grasp", "GentleGrasp", "DynamicGrasp"},
+                "TRANSFER": {"Transfer", "MoveTo", "Transport", "TransportToPreHandoverPose"},
+            }
+            cursor = 0
+            for step in steps:
+                action_name = getattr(step, "action", None)
+                action_name = getattr(action_name, "value", action_name)
+                allowed = skill_by_action.get(str(action_name).upper())
+                if not allowed:
+                    continue
+                found = next((i for i in range(cursor, len(actions)) if actions[i] in allowed), None)
+                if found is None:
+                    issues.append(_issue(ErrorCategory.CROSS_FIELD, "BT_STEP_ORDER_MISMATCH",
+                        f"Composite step {getattr(step, 'step_index', '?')} ({action_name}) is missing or out of order",
+                        severity="error", subject="steps"))
+                    break
+                cursor = found + 1
 
     # ══════════════════════════════════════════════════════════
     # CONSTRAINT: numeric and safety enforcement

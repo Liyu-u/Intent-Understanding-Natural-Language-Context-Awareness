@@ -19,7 +19,7 @@ from .spatial_constraint import SpatialConstraint
 from .physical_constraint import PhysicalConstraint
 from .safety_constraint import SafetyConstraint
 from .rule_engine import ConstraintRuleEngine
-from .constraint_compiler import HybridConstraintCompiler, compile_constraints
+from .constraint_compiler import HybridConstraintCompiler, compile_constraints, compile_feasible_domain, FeasibleDomainResult
 
 __all__ = [
     "ConstraintNode",
@@ -33,4 +33,6 @@ __all__ = [
     "ConstraintRuleEngine",
     "HybridConstraintCompiler",
     "compile_constraints",
+    "compile_feasible_domain",
+    "FeasibleDomainResult",
 ]

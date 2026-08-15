@@ -179,7 +179,7 @@ class UpgradedEvalRunner:
             llm_attempted = False
             llm_succeeded = False
 
-            if self._planner is not None:
+            if False and self._planner is not None:
                 llm_attempted = True
                 self.engine_stats["deepseek_call_attempted"] += 1
                 try:
@@ -193,8 +193,26 @@ class UpgradedEvalRunner:
                     self.engine_stats["fallback_count"] += 1
                     bt = BehaviorTreeGenerator().plan(instruction, scene=scene)
                     actual_engine = f"RuleEngine(fallback:{type(e).__name__})"
-            else:
+            elif False:
                 bt = BehaviorTreeGenerator().plan(instruction, scene=scene)
+                self.engine_stats["rule_engine_direct_count"] += 1
+
+            from robot_intent_agent.semantic_compiler import SemanticCompiler
+            compiled = SemanticCompiler(self._planner).compile(
+                instruction,
+                scene=scene,
+                mode="llm" if self._planner is not None else "rule",
+                request_llm=self._planner is not None,
+            )
+            bt = compiled.behavior_tree
+            compiler_trace = bt.metadata.get("engine_trace", {}) if isinstance(bt.metadata, dict) else {}
+            if compiler_trace.get("llm_call_attempted"):
+                self.engine_stats["deepseek_call_attempted"] += 1
+            if compiler_trace.get("llm_call_succeeded"):
+                self.engine_stats["deepseek_call_succeeded"] += 1
+            if compiler_trace.get("fallback_used"):
+                self.engine_stats["fallback_count"] += 1
+            if not compiler_trace.get("llm_call_attempted"):
                 self.engine_stats["rule_engine_direct_count"] += 1
 
             # Ensure engine trace in BT metadata
@@ -202,11 +220,11 @@ class UpgradedEvalRunner:
                 bt.metadata["engine_trace"] = {}
             bt.metadata["engine_trace"].update({
                 "requested_engine": self._requested_engine,
-                "actual_engine": actual_engine,
-                "llm_call_attempted": llm_attempted,
-                "llm_call_succeeded": llm_succeeded,
-                "fallback_used": fallback_used,
-                "fallback_reason": fallback_reason,
+                "actual_engine": compiler_trace.get("actual_engine", "RuleEngine"),
+                "llm_call_attempted": compiler_trace.get("llm_call_attempted", False),
+                "llm_call_succeeded": compiler_trace.get("llm_call_succeeded", False),
+                "fallback_used": compiler_trace.get("fallback_used", False),
+                "fallback_reason": compiler_trace.get("fallback_reason"),
             })
 
             cg = HybridConstraintCompiler().compile(instruction, bt, scene=scene, target=target)
@@ -488,11 +506,15 @@ if __name__ == "__main__":
     print()
 
     runner = UpgradedEvalRunner(ds_path)
-    metrics = runner.run_all()
+    artifact = runner.run_all()
+    metrics = artifact.summary
+    if metrics is None:
+        print("FATAL: evaluation produced no metrics summary")
+        sys.exit(1)
 
     # Consistency check before export
     try:
-        _check_then_export(metrics, runner.verdicts)
+        _check_then_export(metrics, artifact.case_results)
     except RuntimeError as e:
         print(f"FATAL: {e}")
         sys.exit(1)
@@ -513,10 +535,11 @@ if __name__ == "__main__":
           f"P95: {metrics.latency_p95_ms:.1f}ms  P99: {metrics.latency_p99_ms:.1f}ms")
 
     # Export
+    out_dir.mkdir(parents=True, exist_ok=True)
     run_id = metrics.run_id
     export_summary_json(metrics, str(out_dir / "summary.json"))
     export_report_md(metrics, runner.verdicts, str(out_dir / "report.md"))
-    export_case_results_json(runner.verdicts, str(out_dir / "case_results.json"), run_id=run_id)
-    export_failures_csv(runner.verdicts, str(out_dir / "failures.csv"), run_id=run_id)
+    export_case_results_json(artifact.case_results, str(out_dir / "case_results.json"), run_id=run_id)
+    export_failures_csv(artifact.case_results, str(out_dir / "failures.csv"), run_id=run_id)
     print(f"\nExported: summary.json, report.md, case_results.json, failures.csv")
     print(f"All files share run_id: {run_id}")

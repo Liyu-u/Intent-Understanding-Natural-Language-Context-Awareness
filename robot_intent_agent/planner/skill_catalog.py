@@ -208,6 +208,47 @@ class SkillCatalog:
             runtime_safety_guards=["trajectory_guard", "collision_guard"],
         ),
 
+        # Canonical semantic-compiler name.  ``MoveTo`` remains as a
+        # backwards-compatible alias for existing downstream consumers.
+        "Transport": SkillDefinition(
+            name="Transport",
+            description="Transport {target} in hand to {destination}",
+            preconditions=["target_in_hand", "destination_reachable", "path_clear_to_destination"],
+            effects=["target_at_destination", "ready_for_release"],
+            params_schema={"target": "str", "destination": "str", "velocity_ms": "float"},
+            safety_notes=["Collision-free path required"],
+            success_conditions=["target_at_destination"],
+            failure_conditions=["path_blocked", "destination_unreachable", "timeout_exceeded"],
+            timeout_s=6.0,
+            runtime_safety_guards=["trajectory_guard", "collision_guard"],
+        ),
+
+        "MoveToHandoverZone": SkillDefinition(
+            name="MoveToHandoverZone",
+            description="Move the held {target} to the configured handover zone",
+            preconditions=["target_in_hand", "handover_pose_known"],
+            effects=["at_handover_zone"],
+            params_schema={"target": "str", "handover_zone": "str"},
+            safety_notes=["Recipient pose or configured handover zone is required"],
+            success_conditions=["at_handover_zone"],
+            failure_conditions=["handover_pose_missing", "timeout_exceeded"],
+            timeout_s=6.0,
+            runtime_safety_guards=["human_proximity_guard", "collision_guard"],
+        ),
+
+        "WaitUntil": SkillDefinition(
+            name="WaitUntil",
+            description="Wait until condition {target} is satisfied",
+            preconditions=["condition_observable"],
+            effects=["condition_satisfied"],
+            params_schema={"condition": "str", "timeout_s": "float"},
+            safety_notes=["Timeout is mandatory"],
+            success_conditions=["condition_satisfied"],
+            failure_conditions=["timeout_exceeded", "condition_unobservable"],
+            timeout_s=5.0,
+            runtime_safety_guards=["timeout_guard"],
+        ),
+
         # ── Release ──
         "Release": SkillDefinition(
             name="Release",

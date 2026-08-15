@@ -32,7 +32,8 @@ Hybrid Constraint Compiler — 混合约束编译器
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Iterable
+from dataclasses import dataclass, field
 
 from robot_intent_agent.config.settings import get_settings
 from robot_intent_agent.task_semantics import (
@@ -67,6 +68,78 @@ from .physical_constraint import PhysicalConstraint
 from robot_intent_agent.schemas.scene import SemanticSceneGraph
 from robot_intent_agent.schemas.behavior_tree import BehaviorTree, BTNode, BTNodeType, SkillAction
 from robot_intent_agent.planner.skill_catalog import SkillCatalog
+
+
+@dataclass
+class FeasibleDomainResult:
+    """Result of interval intersection (never an average of constraints)."""
+    parameter: str
+    min_value: Optional[float]
+    max_value: Optional[float]
+    selected_value: Optional[float]
+    status: PlanStatus
+    sources: List[str] = field(default_factory=list)
+    substituted_from: Optional[float] = None
+    reason: str = ""
+
+    def model_dump(self) -> Dict[str, Any]:
+        return self.__dict__.copy()
+
+
+def compile_feasible_domain(
+    parameter: str,
+    constraints: Iterable[Dict[str, Any]],
+    default_domain: Tuple[Optional[float], Optional[float]] = (None, None),
+    allow_safe_substitution: bool = True,
+) -> FeasibleDomainResult:
+    """Intersect hard intervals and choose a safe value.
+
+    Each constraint may contain ``min``/``max`` or ``min_value``/``max_value``
+    plus an optional ``value`` and ``operator``.  A contradictory interval is
+    ``BLOCKED``; no midpoint can make an empty domain executable.
+    """
+    lower, upper = default_domain
+    sources: List[str] = []
+    requested: Optional[float] = None
+    for item in constraints or []:
+        operator = str(item.get("operator", "")).lower()
+        value = item.get("value")
+        item_min = item.get("min_value", item.get("min"))
+        item_max = item.get("max_value", item.get("max"))
+        source = str(item.get("source") or item.get("source_kind") or "constraint")
+        sources.append(source)
+        if operator in {"exact", "eq", "="} and value is not None:
+            requested = float(value); item_min = value; item_max = value
+        elif operator in {"min", ">=", "at_least"}:
+            item_min = value if item_min is None else item_min
+            if value is not None: requested = requested if requested is not None else float(value)
+        elif operator in {"max", "<=", "at_most"}:
+            item_max = value if item_max is None else item_max
+            if value is not None: requested = requested if requested is not None else float(value)
+        elif operator == "range":
+            pass
+        if item_min is not None:
+            lower = float(item_min) if lower is None else max(lower, float(item_min))
+        if item_max is not None:
+            upper = float(item_max) if upper is None else min(upper, float(item_max))
+    if lower is not None and upper is not None and lower > upper:
+        return FeasibleDomainResult(parameter, lower, upper, None, PlanStatus.BLOCKED,
+                                    sources, requested, "empty_intersection")
+    if requested is None:
+        selected = lower if lower is not None else upper
+        status = PlanStatus.READY
+        return FeasibleDomainResult(parameter, lower, upper, selected, status, sources)
+    if (lower is None or requested >= lower) and (upper is None or requested <= upper):
+        return FeasibleDomainResult(parameter, lower, upper, requested, PlanStatus.READY, sources)
+    if not allow_safe_substitution:
+        return FeasibleDomainResult(parameter, lower, upper, None, PlanStatus.BLOCKED,
+                                    sources, requested, "requested_value_outside_domain")
+    selected = requested
+    if lower is not None: selected = max(selected, lower)
+    if upper is not None: selected = min(selected, upper)
+    return FeasibleDomainResult(parameter, lower, upper, selected,
+                                PlanStatus.READY_WITH_SAFE_SUBSTITUTION, sources,
+                                requested, "safe_clamp_to_intersection")
 
 
 class HybridConstraintCompiler:
@@ -138,12 +211,20 @@ class HybridConstraintCompiler:
         # ══════════════════════════════════════════
         # 第 1 层: Rule Engine 提取约束
         # ══════════════════════════════════════════
-        rule_constraints = self.engine.extract(
-            instruction=instruction,
-            scene=scene,
-            target=target,
-            memory_context=memory_context or [],
-        )
+        # The semantic graph is the source for user constraints and obstacles.
+        # The legacy rule extractor remains only as a compatibility supplement
+        # for old BTs without compiler metadata.
+        if behavior_tree.metadata.get("semantic_authority") == "SemanticCompiler":
+            rule_constraints = self._graph_constraints(
+                parsed_task, scene=scene, target=target, memory_context=memory_context or []
+            )
+        else:
+            rule_constraints = self.engine.extract(
+                instruction=instruction,
+                scene=scene,
+                target=target,
+                memory_context=memory_context or [],
+            )
         graph.add_all(rule_constraints)
 
         # ══════════════════════════════════════════
@@ -204,6 +285,50 @@ class HybridConstraintCompiler:
         graph.metadata["plan_decision"] = plan_decision.model_dump()
 
         return graph
+
+    def _graph_constraints(self, parsed_task: ParsedTask, scene=None, target: str = "",
+                           memory_context: Optional[List[Dict[str, Any]]] = None) -> List[ConstraintNode]:
+        constraints: List[ConstraintNode] = []
+        # User numeric atoms are injected by _inject_user_requests below.
+        # Do not materialize them a second time here: an EXACT request would
+        # otherwise become both a parsed exact constraint and a hard interval,
+        # turning a safely substitutable request (5N on a 3N object) into an
+        # artificial empty domain.
+        for obstacle in parsed_task.obstacle:
+            constraints.append(SpatialConstraint.collision_avoid(
+                obstacle=obstacle.entity_id or obstacle.mention,
+                min_distance_m=0.05,
+                applies_to_skill="",
+                priority=ConstraintPriority.HARD,
+            ))
+        # Scene-derived physical limits are part of the grounded execution
+        # contract, not a second language parser.  Use the already grounded
+        # entity and the domain property mapper to preserve fragility and
+        # precision-object limits.
+        target_obj = self._scene_object_for(scene, parsed_task.theme) if scene is not None else None
+        target_name = getattr(target_obj, "name", None) or (parsed_task.theme.mention if parsed_task.theme else target)
+        if scene is not None and target_name:
+            constraints.extend(self.engine._extract_object_constraints(scene, target_name))
+            constraints.extend(self.engine._extract_scene_constraints(scene, target_name))
+        if memory_context:
+            constraints.extend(self.engine._extract_memory_constraints(memory_context, target_name))
+        return constraints
+
+    @staticmethod
+    def _scene_object_for(scene: Optional[SemanticSceneGraph], ref: Any):
+        if scene is None or ref is None:
+            return None
+        entity_id = getattr(ref, "entity_id", None)
+        mention = getattr(ref, "mention", None) or str(ref)
+        if entity_id:
+            found = scene.find_object(entity_id)
+            if found:
+                return found
+        found = scene.find_object(mention)
+        if found:
+            return found
+        return next((obj for obj in scene.objects
+                     if mention and (mention in obj.name or obj.name in mention)), None)
 
     # ============================================================
     # 第 1.5 层: 注入 user_request 约束
@@ -312,13 +437,13 @@ class HybridConstraintCompiler:
         # 默认绑定规则
         skill_bindings: Dict[str, List[str]] = {
             "force_limit":      ["Grasp", "GentleGrasp"],
-            "velocity_limit":   ["MoveTo", "Reach", "Push"],
+            "velocity_limit":   ["MoveTo", "Transport", "Reach", "Push"],
             "collision_avoid":  [],   # 空 = 全局
             "z_axis_floor":     [],   # 空 = 全局
             "joint_limits":     [],
             "max_gripper_force": ["Grasp", "GentleGrasp"],
             "workspace_bounds": [],
-            "human_proximity":  ["MoveTo"],
+            "human_proximity":  ["MoveTo", "Transport"],
             "release_height":   ["Release"],
             "gripper_width":    ["Grasp", "GentleGrasp", "Release"],
         }
@@ -384,7 +509,7 @@ class HybridConstraintCompiler:
         for action in bt.root.flatten_actions():
             if action.skill_name in ("Grasp", "GentleGrasp", "DynamicGrasp") and final_force and final_force.selected_value is not None:
                 action.params["force_n"] = final_force.selected_value
-            if action.skill_name in ("Reach", "MoveTo", "Push") and final_velocity and final_velocity.selected_value is not None:
+            if action.skill_name in ("Reach", "MoveTo", "Transport", "Push") and final_velocity and final_velocity.selected_value is not None:
                 action.params["velocity_ms"] = final_velocity.selected_value
 
     # ============================================================
@@ -404,7 +529,7 @@ class HybridConstraintCompiler:
             if node.constraint_type == "force_limit":
                 min_f = node.params.get("min_force_n", 0.1)
                 max_f = node.params.get("max_force_n", 10.0)
-                if min_f >= max_f:
+                if min_f > max_f:
                     violations.append(
                         f"CONFLICT: {node.id}: min_force({min_f}) >= max_force({max_f})"
                     )
@@ -456,16 +581,13 @@ class HybridConstraintCompiler:
 
         if force_resolution.request_infeasible or velocity_resolution.request_infeasible:
             if plan_status != PlanStatus.NEEDS_CLARIFICATION:
-                # User EXACT request exceeding hard limits → escalate to NEEDS_CLARIFICATION
-                # (user explicitly asked for a specific value that's unsafe)
-                exact_user_request_infeasible = (
-                    force_resolution.substitution_reason
-                    and "USER_EXACT" in (force_resolution.substitution_reason or "")
-                )
-                if exact_user_request_infeasible:
-                    plan_status = PlanStatus.NEEDS_CLARIFICATION
-                else:
-                    plan_status = PlanStatus.READY_WITH_SAFE_SUBSTITUTION
+                # Finite numeric requests outside the robot/object domain are
+                # clamped by _resolve_numeric_parameter.  Dispatch the safe
+                # value and expose the substitution in the audit ledger.
+                # Clarification is reserved for missing/ambiguous semantics;
+                # treating 50N→2N as a clarification unnecessarily blocked a
+                # recoverable operation.
+                plan_status = PlanStatus.READY_WITH_SAFE_SUBSTITUTION
 
         if force_resolution.domain.is_empty() or velocity_resolution.domain.is_empty():
             plan_status = PlanStatus.BLOCKED
@@ -479,8 +601,30 @@ class HybridConstraintCompiler:
             if blocking_missing:
                 plan_status = PlanStatus.NEEDS_CLARIFICATION
 
+        if parsed_task.action == TaskActionKind.WAIT and "condition" in grounded_task.missing_roles:
+            plan_status = PlanStatus.NEEDS_CLARIFICATION
+
         if parsed_task.action == TaskActionKind.PLACE and "support_surface" in grounded_task.missing_roles:
             plan_status = PlanStatus.NEEDS_CLARIFICATION
+
+        # Distinguish a recoverable request outside robot/object limits from
+        # an internally contradictory user instruction.  The former may be
+        # clamped; the latter must remain blocked (e.g. EXACT 8N plus MAX 2N).
+        by_parameter = {}
+        for constraint in parsed_task.user_constraints:
+            by_parameter.setdefault(constraint.parameter, []).append(constraint)
+        for parameter, constraints in by_parameter.items():
+            exact_values = [c.value for c in constraints if c.operator.value == "exact" and c.value is not None]
+            if len(set(exact_values)) > 1:
+                plan_status = PlanStatus.BLOCKED
+            min_values = [c.value if c.value is not None else c.min_value for c in constraints if c.operator.value == "min"]
+            max_values = [c.value if c.value is not None else c.max_value for c in constraints if c.operator.value == "max"]
+            if any(v is not None and any(m is not None and v < m for m in min_values) for v in exact_values):
+                plan_status = PlanStatus.BLOCKED
+            if any(v is not None and any(m is not None and v > m for m in max_values) for v in exact_values):
+                plan_status = PlanStatus.BLOCKED
+            if min_values and max_values and max(min_values) > min(max_values):
+                plan_status = PlanStatus.BLOCKED
 
         resolution.plan_status = plan_status
         # Only actual overrides (not all audit trail entries) go into override_ledger
@@ -528,8 +672,8 @@ class HybridConstraintCompiler:
         audit: List[Dict[str, Any]] = []
 
         target_obj = None
-        if scene and parsed_task.theme and parsed_task.theme.entity_id:
-            target_obj = scene.find_object(parsed_task.theme.entity_id) or scene.find_object(parsed_task.theme.mention)
+        if scene and parsed_task.theme:
+            target_obj = self._scene_object_for(scene, parsed_task.theme)
 
         if target_obj is not None:
             try:
@@ -563,6 +707,13 @@ class HybridConstraintCompiler:
                 pass
 
         for node in nodes:
+            # Parsed user atoms are the authoritative source for exact/min/max
+            # semantics.  The compatibility node created by
+            # _inject_user_requests is an annotation for binding/traceability,
+            # not a second hard interval; counting it here makes 5N on a 2N
+            # object look like an internal empty domain before substitution.
+            if node.params.get("_source_label") == "user_request":
+                continue
             if parameter == "force_n" and node.constraint_type in ("force_limit", "max_gripper_force"):
                 max_force = node.params.get("max_force_n")
                 min_force = node.params.get("min_force_n")

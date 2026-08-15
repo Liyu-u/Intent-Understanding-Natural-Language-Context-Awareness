@@ -116,7 +116,7 @@ class PreExecutionValidator:
             theme = getattr(pt, "theme", None)
             if theme:
                 theme_id = getattr(theme, "entity_id", None)
-                if theme_id and theme_id not in scene_ids:
+                if theme_id and theme_id not in scene_ids and theme_id not in {"user", "operator"}:
                     issues.append({"code": "TARGET_MISSING", "severity": "error", "message": f"Target entity {theme_id} not found in current scene"})
                     stop_requested = True
                     stop_reasons.append("target_missing")
@@ -143,7 +143,7 @@ class PreExecutionValidator:
             recip = getattr(pt, "recipient", None)
             if recip:
                 recip_id = getattr(recip, "entity_id", None)
-                if recip_id and recip_id != "user" and recip_id not in scene_ids:
+                if recip_id and recip_id not in {"user", "operator"} and recip_id not in scene_ids:
                     issues.append({"code": "RECIPIENT_MISSING", "severity": "error", "message": f"Recipient {recip_id} not found in current scene"})
                     stop_requested = True
                     stop_reasons.append("recipient_missing")
@@ -152,7 +152,7 @@ class PreExecutionValidator:
         scene_ids = {getattr(o, "id", "") for o in getattr(current_scene, "objects", [])} if current_scene else set()
         for action in bt.root.flatten_actions():
             tid = action.params.get("target_entity_id", "")
-            if tid and tid not in scene_ids:
+            if tid and tid not in scene_ids and tid not in {"user", "operator"}:
                 issues.append({"code": "BT_ENTITY_MISSING", "severity": "error", "message": f"BT action {action.skill_name} references missing entity {tid}"})
 
         # ── 8. No error-level issues from original validation ──

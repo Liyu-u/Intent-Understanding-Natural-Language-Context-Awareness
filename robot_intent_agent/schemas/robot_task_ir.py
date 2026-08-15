@@ -113,6 +113,7 @@ class PlanMetadata(BaseModel):
     constraint_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     plan_feasibility_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     execution_readiness: float = Field(default=0.0, ge=0.0, le=1.0)
+    execution_allowed: bool = Field(default=False)
 
 
 # ============================================================
@@ -237,6 +238,21 @@ class RobotTaskIR(BaseModel):
     # ── Phase 8: Semantic enforcement trace — full-chain prohibition/condition audit ──
     semantic_enforcement_trace: Dict[str, Any] = Field(default_factory=dict,
         description="Full-chain trace of every prohibition and condition through all pipeline stages")
+    # Explicit downstream contract.  This makes completeness measurable in
+    # the final JSON instead of inferring it from optional fields at runtime.
+    output_contract: Dict[str, Any] = Field(default_factory=dict,
+        description="JSON completeness, field provenance and serialization contract")
+    # Semantic-compiler outputs.  These remain separate from legacy fields so
+    # downstream consumers can migrate without re-parsing natural language.
+    semantic_task_graph: Dict[str, Any] = Field(default_factory=dict)
+    grounding_decisions: List[Dict[str, Any]] = Field(default_factory=list)
+    ambiguity_resolution: List[Dict[str, Any]] = Field(default_factory=list)
+    fusion_trace: List[Dict[str, Any]] = Field(default_factory=list)
+    execution_contract: Dict[str, Any] = Field(default_factory=dict)
+    # Stable external projection consumed by the downstream decision agent.
+    # The semantic task graph remains the internal authority; this field is a
+    # versioned, flat compatibility view of that graph.
+    intent_output: Dict[str, Any] = Field(default_factory=dict)
 
     def model_post_init(self, __context: Any) -> None:
         if self.compiled_constraints is not None and hasattr(self.compiled_constraints, 'task_id'):

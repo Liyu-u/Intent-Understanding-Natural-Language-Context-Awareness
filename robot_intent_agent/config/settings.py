@@ -48,20 +48,24 @@ class Settings(BaseSettings):
         description="DeepSeek 模型: deepseek-chat (V3) | deepseek-reasoner (R1)",
     )
     deepseek_temperature: float = Field(
-        default=0.1, ge=0.0, le=2.0,
+        default=0.0, ge=0.0, le=2.0,
         description="LLM 温度参数",
     )
     deepseek_max_tokens: int = Field(
-        default=4096,
+        default=2400,
         description="最大输出 token 数",
     )
     deepseek_timeout_s: float = Field(
-        default=30.0,
+        default=20.0,
         description="API 调用超时 (秒)",
     )
     deepseek_max_retries: int = Field(
         default=1,
         description="API 调用失败重试次数",
+    )
+    llm_cache_enabled: bool = Field(
+        default=True,
+        description="是否缓存不含物理实体ID的语义候选",
     )
 
     # --- 混合路由配置 ---

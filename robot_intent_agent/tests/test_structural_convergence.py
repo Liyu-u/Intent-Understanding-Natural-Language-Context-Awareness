@@ -142,6 +142,18 @@ class TestProductionPathIntegrity:
         assert "RobotTaskIRGenerator" in source, \
             "Eval runner must use RobotTaskIRGenerator"
 
+    def test_semantic_compiler_is_single_authority_in_web_ui(self):
+        source = (REPO_ROOT / "demo" / "web_ui.py").read_text(encoding="utf-8")
+        assert "SemanticCompiler" in source
+        assert "llm_bt_discarded" in source
+        assert "if False:" in source, "legacy planner branch must remain unreachable"
+
+    def test_downstream_ir_does_not_reparse_authoritative_instruction(self):
+        source = (REPO_ROOT / "ir" / "ir_generator.py").read_text(encoding="utf-8")
+        assert "semantic_authority" in source
+        assert "find_action_constraint_conflicts(" in source
+        assert "semantic_authority=semantic_authority" in source
+
     def test_no_sys_path_hack_in_production_demos(self):
         """sys.path.insert should not exist in production demo files."""
         # These files have sys.path.insert for running standalone
@@ -206,11 +218,17 @@ class TestFileStructureIntegrity:
         assert not real_dups, f"Duplicate module names within same directory: {real_dups}"
 
     def test_schema_files_count_unchanged(self):
-        """Schema files must not be duplicated."""
+        """Schema files must not be duplicated; semantic graph is canonical."""
         schema_dir = REPO_ROOT / "schemas"
         py_files = list(schema_dir.glob("*.py"))
-        assert len(py_files) <= 6, \
-            f"Schema directory should have <=6 .py files, has {len(py_files)}"
+        # The semantic-compiler architecture adds the canonical graph plus
+        # the two explicit input/output boundary schemas.  Keep the bound
+        # explicit so accidental schema proliferation is still detected.
+        assert len(py_files) <= 9, \
+            f"Schema directory should have <=9 .py files, has {len(py_files)}"
+        assert (schema_dir / "semantic_task_graph.py").exists()
+        assert (schema_dir / "intent_output.py").exists()
+        assert (schema_dir / "perception_observation.py").exists()
 
     def test_constraint_files_count_stable(self):
         """Constraint module files must not grow unexpectedly."""
