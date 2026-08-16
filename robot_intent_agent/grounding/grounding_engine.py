@@ -71,7 +71,23 @@ class GroundingEngine:
         # already the authoritative evidence for path safety.
         theme_decision = decisions.get("theme")
         if theme_decision and theme_decision.selected_entity_id:
-            for blocker_id in getattr(scene, "blocking_objects", lambda _id: [])(theme_decision.selected_entity_id):
+            blocker_ids = list(getattr(scene, "blocking_objects", lambda _id: [])(
+                theme_decision.selected_entity_id
+            ))
+            # Some perception feeds encode a fixture/obstacle as a fixed
+            # object but omit an explicit BLOCKING relation.  It is still a
+            # collision-relevant scene entity for manipulation safety.  Use
+            # this conservative fallback only for obstacle-like categories;
+            # ordinary tables and trays remain valid destinations.
+            if not blocker_ids:
+                obstacle_like = {"fixture", "obstacle", "table_edge", "hot_surface", "barrier"}
+                blocker_ids = [
+                    getattr(item, "id", "") for item in getattr(scene, "objects", []) or []
+                    if getattr(item, "id", "") != theme_decision.selected_entity_id
+                    and str(getattr(item, "specific_class", None)
+                            or getattr(item, "label", None) or "").lower() in obstacle_like
+                ]
+            for blocker_id in blocker_ids:
                 if blocker_id not in excluded:
                     blocker = scene.find_object(blocker_id) if hasattr(scene, "find_object") else None
                     if blocker is not None:

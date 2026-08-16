@@ -5,6 +5,20 @@ from __future__ import annotations
 from typing import Any, Iterable, List, Optional
 
 
+_ATTRIBUTE_ALIASES = {
+    "红": "red", "红色": "red", "蓝": "blue", "蓝色": "blue",
+    "绿": "green", "绿色": "green", "黄": "yellow", "黄色": "yellow",
+    "白": "white", "白色": "white", "黑": "black", "黑色": "black",
+    "透明": "transparent", "玻璃": "glass", "塑料": "plastic",
+    "金属": "metal", "木质": "wood", "橡胶": "rubber",
+}
+
+
+def _canonical_attribute(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return _ATTRIBUTE_ALIASES.get(text, text)
+
+
 class CandidateRetriever:
     def retrieve(self, scene: Any, category: Optional[str] = None, attributes: Optional[dict] = None,
                  mention: Optional[str] = None,
@@ -76,7 +90,8 @@ class CandidateRetriever:
             # candidates at retrieval time.
             if any(key not in {"size", "shape", "spatial_relation"}
                    and value is not None
-                   and str(obj_attrs.get(key, "")).lower() != str(value).lower()
+                   and _canonical_attribute(obj_attrs.get(key, ""))
+                       != _canonical_attribute(value)
                    for key, value in attributes.items() if value is not None):
                 continue
             result.append(obj)

@@ -127,8 +127,11 @@ class RobotTaskIRGenerator:
                     subject="semantic_grounding",
                 ))
             validation_result.execution_allowed = False
-            validation_result.status = PlanStatus.NEEDS_CLARIFICATION
-            constraint_resolution.plan_status = PlanStatus.NEEDS_CLARIFICATION
+            unsupported_request = "unsupported_capability" in (parsed_task.unmet_roles or [])
+            validation_result.status = (
+                PlanStatus.BLOCKED if unsupported_request else PlanStatus.NEEDS_CLARIFICATION
+            )
+            constraint_resolution.plan_status = validation_result.status
 
         # Final deterministic safety gate.  This runs after parsing/grounding
         # and before the plan can be marked executable, regardless of planner.

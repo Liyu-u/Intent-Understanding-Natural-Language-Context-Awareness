@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 from robot_intent_agent.domain.action_schemas import get_action_schema, normalize_action
 from robot_intent_agent.grounding.grounding_engine import GroundingEngine
 from robot_intent_agent.schemas.semantic_task_graph import (
+    AmbiguityRecord,
     EvidenceSpan,
     SemanticCandidate,
     SemanticEntity,
@@ -130,6 +131,25 @@ class SemanticCompiler:
             engine_trace["fallback_reason"] = "llm_unavailable"
 
         llm_candidate = llm_candidates[0] if llm_candidates else None
+        # Enforce the domain boundary before provider output reaches repair or
+        # fusion.  An out-of-contract process verb must become a blocked
+        # CUSTOM request; allowing a malformed provider answer to enter the
+        # fusion path can turn a safe rejection into an exception or an
+        # invented manipulation action.
+        unsupported_evidence = (rule_candidate.graph.metadata or {}).get(
+            "unsupported_action_evidence"
+        )
+        if unsupported_evidence and llm_candidate is not None:
+            engine_trace["fallback_used"] = True
+            engine_trace["fallback_reason"] = (
+                f"unsupported_domain_action:{unsupported_evidence}"
+            )
+            engine_trace["llm_candidate_rejected"] = True
+            engine_trace["llm_candidate_rejection_reasons"] = [
+                "UNSUPPORTED_DOMAIN_ACTION"
+            ]
+            llm_candidates = []
+            llm_candidate = None
         if llm_candidate is not None:
             candidate_errors = self._validate_llm_candidate_contract(llm_candidate)
             if not candidate_errors:
@@ -171,6 +191,27 @@ class SemanticCompiler:
                     None, fused.graph.model_dump(mode="json"),
                     "REJECT_LLM_SEMANTIC_REGRESSION", ";".join(regressions[:6])))
         graph = fused.graph
+
+        # Domain boundary is a hard safety invariant.  If the deterministic
+        # parser witnessed a process/sensing verb outside the ten supported
+        # actions, an LLM answer that invents a supported manipulation is not
+        # a useful correction.  Keep the rule graph's CUSTOM result so the
+        # final adapter reports a blocked unsupported request.
+        if unsupported_evidence and any(
+                normalize_action(event.action) != "CUSTOM" for event in graph.events
+        ):
+            engine_trace["fallback_used"] = True
+            engine_trace["fallback_reason"] = (
+                f"unsupported_domain_action:{unsupported_evidence}"
+            )
+            engine_trace["llm_candidate_rejected"] = True
+            engine_trace["llm_candidate_rejection_reasons"] = [
+                "UNSUPPORTED_DOMAIN_ACTION"
+            ]
+            llm_candidates = []
+            llm_candidate = None
+            fused = rule_candidate
+            graph = fused.graph
 
         if scene is not None:
             self._normalize_fetch_receive_role(graph)
@@ -228,6 +269,60 @@ class SemanticCompiler:
                     # an embedded phrase such as "操作人员面前".
                     event.destination_ref = None
             grounding_decisions = [self._decision_dict(item) for item in decisions.values()]
+
+            # A non-resolved required role is an ambiguity/clarification
+            # record, not permission to use the first ranked object.  This
+            # converts grounding's decision into the graph-level status that
+            # all downstream validators consume.
+            for event in graph.events:
+                action = normalize_action(event.action)
+                if action == "WAIT":
+                    # WAIT is condition-only; its schema's symbolic
+                    # condition role is not a scene-grounding role.
+                    continue
+                schema = get_action_schema(action)
+                role_values = {
+                    "theme": event.theme_ref,
+                    "destination": event.destination_ref,
+                    "source": event.source_ref,
+                    "recipient": event.recipient_ref,
+                }
+                required_groups = [tuple(schema.required_roles), *schema.required_any_roles]
+                for group in required_groups:
+                    decisions_for_group = []
+                    if any(role in role_values and role_values[role] for role in group):
+                        decisions_for_group = [
+                            decisions.get(role) for role in group if decisions.get(role) is not None
+                        ]
+                        if any(getattr(item, "decision", "") == "RESOLVED"
+                               for item in decisions_for_group):
+                            continue
+                    elif group:
+                        decisions_for_group = []
+                    unresolved = [
+                        item for item in decisions_for_group
+                        if getattr(item, "decision", "") != "RESOLVED"
+                    ]
+                    if not unresolved and not decisions_for_group and not any(
+                            role_values.get(role) for role in group
+                    ):
+                        unresolved = [None]
+                    if unresolved:
+                        ambiguity_id = f"grounding-{event.event_id}-{'-'.join(group)}"
+                        if not any(item.ambiguity_id == ambiguity_id
+                                   for item in graph.ambiguities):
+                            graph.ambiguities.append(AmbiguityRecord(
+                                ambiguity_id=ambiguity_id,
+                                type="GROUNDING_AMBIGUITY",
+                                candidates=[
+                                    entity_id for role in group
+                                    for entity_id in getattr(decisions.get(role), "candidate_ids", [])
+                                ],
+                                status="UNRESOLVED",
+                                clarification=(
+                                    f"请明确{group[0]}对应的唯一对象。"
+                                ),
+                            ))
 
             # A role may have been created by a parser-side scene selector but
             # still carry no entity_id when the selector was ambiguous. Keep
@@ -307,6 +402,13 @@ class SemanticCompiler:
             fusion_trace=[item.model_dump() for item in audit],
         )
         grounded_task = build_grounded_task(parsed_task, scene=scene)
+
+        if unsupported_evidence:
+            parsed_task.notes.append(
+                f"unsupported_capability:{unsupported_evidence}"
+            )
+            if "unsupported_capability" not in parsed_task.unmet_roles:
+                parsed_task.unmet_roles.append("unsupported_capability")
 
         # Reject a graph that still contains unknown local references before
         # any executable artifact is considered valid.
@@ -475,7 +577,8 @@ class SemanticCompiler:
             r"收取|接收|回收|机器人身边|机器人接收区|指定接收|到我这|到这边|到手边|回到机器人",
             text,
         ))
-        receive_zones = []
+        declared_receive_zones = []
+        surface_zones = []
         for obj in getattr(scene, "objects", []) or []:
             attrs = getattr(obj, "attributes", {}) or {}
             upstream = attrs.get("_upstream_affordances", []) or []
@@ -492,10 +595,16 @@ class SemanticCompiler:
                 "tray", "bin", "parts_bin", "table", "workbench",
                 "platform", "receive_zone", "inspection_zone",
             }
-            if is_surface and (endpoint_language or any(
-                    str(item) in {"robot_receive_zone", "receive_zone"}
-                    for item in upstream)):
-                receive_zones.append(obj)
+            if is_surface:
+                surface_zones.append(obj)
+                if any(str(item) in {"robot_receive_zone", "receive_zone"}
+                       for item in upstream):
+                    declared_receive_zones.append(obj)
+        # A perception-declared receive zone is stronger than generic fixed
+        # surfaces. Prefer it whenever present; otherwise an endpoint phrase
+        # may use a unique fixed/container/support surface. This prevents a
+        # fixture and a tray from making one receive zone appear ambiguous.
+        receive_zones = declared_receive_zones or (surface_zones if endpoint_language else [])
         if len(receive_zones) != 1:
             return
         zone = receive_zones[0]
@@ -957,6 +1066,8 @@ class SemanticCompiler:
 
     @staticmethod
     def _initial_status(parsed_task: ParsedTask, grounded_task: Any) -> PlanStatus:
+        if "unsupported_capability" in parsed_task.unmet_roles:
+            return PlanStatus.BLOCKED
         if parsed_task.unmet_roles or grounded_task.required_clarifications:
             return PlanStatus.NEEDS_CLARIFICATION
         if parsed_task.ambiguity_resolution:
@@ -1055,6 +1166,13 @@ def parsed_task_from_graph(
     source = _entity_ref(graph, primary.source_ref if primary else None, "source", scene=scene)
     destination = _entity_ref(graph, primary.destination_ref if primary else None, "destination", scene=scene)
     recipient = _entity_ref(graph, primary.recipient_ref if primary else None, "recipient", scene=scene)
+    if action == TaskActionKind.WAIT:
+        # WAIT has no public manipulation target even if a provider included a
+        # monitoring noun as an event role.
+        theme = None
+        source = None
+        destination = None
+        recipient = None
     support_surface = destination if action == TaskActionKind.PLACE else None
 
     obstacle_refs: List[str] = []
@@ -1073,13 +1191,10 @@ def parsed_task_from_graph(
         if local_ref in seen_obstacles:
             continue
         obstacle_atom = graph.entity(local_ref)
-        # Scene-derived blockers are execution-safety metadata owned by the
-        # planner, not user-mentioned intent roles.  Keep them in the
-        # authoritative graph/BT so PlanPath and ClearPath still enforce
-        # collision avoidance, but do not expose them as explicit natural
-        # language obstacles in the public ParsedTask/IntentOutput.
-        if obstacle_atom is not None and (obstacle_atom.attributes or {}).get("scene_derived"):
-            continue
+        # Scene-derived blockers are still real safety obstacles.  They remain
+        # distinct from language-mentioned prohibitions in the graph, but the
+        # public task must expose their scene IDs so the downstream planner
+        # cannot silently lose collision avoidance information.
         ref = _entity_ref(graph, local_ref, "obstacle", scene=scene)
         if ref is not None:
             obstacles.append(ref)
@@ -1114,6 +1229,10 @@ def parsed_task_from_graph(
     if action == TaskActionKind.WAIT and not graph.conditions:
         unmet_roles.append("condition")
     notes: List[str] = []
+    unsupported_evidence = (graph.metadata or {}).get("unsupported_action_evidence")
+    if unsupported_evidence:
+        notes.append(f"unsupported_capability:{unsupported_evidence}")
+        unmet_roles.append("unsupported_capability")
     if graph.ambiguities:
         notes.extend(f"ambiguity:{item.type}:{item.clarification or item.status}" for item in graph.ambiguities)
     if not events:

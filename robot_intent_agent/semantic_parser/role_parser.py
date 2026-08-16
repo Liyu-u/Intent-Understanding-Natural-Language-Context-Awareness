@@ -69,16 +69,53 @@ def _find_mention(text: str, category: Optional[str] = None, after: int = 0) -> 
     _, _, surface, normalized = sorted(matches)[0]
     index = text.find(surface, after)
     start = index
-    # Include the immediately preceding color/material/size/spatial descriptor.
+    # Keep the complete immediately preceding descriptor chain.  The old
+    # implementation retained only one short adjective (for example
+    # ``白色的药瓶``), which discarded the scene evidence in expressions such
+    # as ``靠近左侧边缘的中等大小的白色药瓶``.  Grounding is the component
+    # that interprets these descriptors, so role extraction must preserve
+    # them instead of trying to resolve the object here.
     prefix_start = start
-    for descriptor in (list(COLORS) + list(MATERIALS) +
-                       ["最左边的", "最右边的", "左边的", "右边的", "前面的", "后面的", "最大的", "最小的"]):
-        if start >= len(descriptor) + 1 and text[start-len(descriptor)-1:start] == descriptor + "的":
-            prefix_start = start-len(descriptor)-1
-            break
-        if start >= len(descriptor) and text[start-len(descriptor):start] == descriptor:
-            prefix_start = start-len(descriptor)
-            break
+    clause_start = max(
+        text.rfind(mark, 0, start) + 1
+        for mark in ("，", "。", "；", ",", ";")
+    )
+    descriptor_scope = text[clause_start:start]
+    descriptor_atom = (
+        r"(?:靠近[^，。；,;]{1,24}?的|位于[^，。；,;]{1,24}?的|"
+        r"操作区前方的|操作区后方的|前方的|后方的|"
+        r"中等大小的|尺寸较大(?:的)?|尺寸较小(?:的)?|"
+        r"偏小的|偏大的|小型的|大型的|矮胖的|短粗的|细长的|长条的|"
+        r"最左边的|最右边的|左侧的|右侧的|左边的|右边的|"
+        r"前面的|后面的|中间的|"
+        r"(?:红色|蓝色|绿色|黄色|白色|黑色|透明|红|蓝|绿|黄|白|黑)色?的?|"
+        r"(?:玻璃|塑料|金属|木质|橡胶)的?)"
+    )
+    # Imperative markers can occur between a scene prefix and its noun:
+    # ``靠近左侧边缘的中等大小的把白色药瓶...``.  Treat those markers as
+    # separators inside the descriptor chain so the original character
+    # offsets remain valid.
+    descriptor_separator = (
+        r"(?:\s*(?:把|将)\s*|"
+        r"\s*让[^，。；,;]{0,24}?\s*)"
+    )
+    descriptor_chain = re.search(
+        rf"(?:{descriptor_atom})(?:(?:{descriptor_separator})?(?:{descriptor_atom}))*$",
+        descriptor_scope,
+    )
+    if descriptor_chain:
+        prefix_start = clause_start + descriptor_chain.start()
+    else:
+        # Preserve the compact legacy forms when they are not covered by the
+        # wider chain (including an attribute without ``的``).
+        for descriptor in (list(COLORS) + list(MATERIALS) +
+                           ["最左边的", "最右边的", "左边的", "右边的", "前面的", "后面的", "最大的", "最小的"]):
+            if start >= len(descriptor) + 1 and text[start-len(descriptor)-1:start] == descriptor + "的":
+                prefix_start = start-len(descriptor)-1
+                break
+            if start >= len(descriptor) and text[start-len(descriptor):start] == descriptor:
+                prefix_start = start-len(descriptor)
+                break
     mention = text[prefix_start:index + len(surface)]
     attrs: Dict[str, object] = {}
     for cn, value in COLORS.items():
@@ -87,6 +124,16 @@ def _find_mention(text: str, category: Optional[str] = None, after: int = 0) -> 
     for cn, value in MATERIALS.items():
         if cn in mention:
             attrs["material"] = value
+    if any(token in mention for token in ("偏小", "较小", "小型", "尺寸较小")):
+        attrs["size"] = "small"
+    elif any(token in mention for token in ("偏大", "较大", "大型", "尺寸较大")):
+        attrs["size"] = "large"
+    elif any(token in mention for token in ("中等大小", "适中")):
+        attrs["size"] = "medium"
+    if any(token in mention for token in ("细长", "长条")):
+        attrs["shape"] = "elongated"
+    elif any(token in mention for token in ("矮胖", "短粗")):
+        attrs["shape"] = "compact"
     relation = None
     for cue, rel in (("最左", "LEFTMOST"), ("最右", "RIGHTMOST"), ("左边", "LEFT"), ("右边", "RIGHT"),
                      ("前面", "FRONT"), ("后面", "BEHIND"), ("中间", "MIDDLE")):
@@ -145,6 +192,10 @@ def parse_roles(instruction: str, actions: List[str]) -> tuple[List[SemanticEnti
     entities: List[SemanticEntity] = []
     role_refs: Dict[str, str] = {}
     seen: Dict[tuple[str, str], str] = {}
+    vague_peer_avoidance = bool(re.search(
+        r"(?:旁边的|附近的|周围的)?(?:同类物体|同类对象|同样的物体|同类目标)",
+        text,
+    ))
 
     def add(role: str, hit: Optional[tuple[str, int, Optional[str], Dict[str, object]]]):
         if not hit:
@@ -170,7 +221,7 @@ def parse_roles(instruction: str, actions: List[str]) -> tuple[List[SemanticEnti
 
     # Explicit role markers are authoritative over generic synonyms.
     destination_match = re.search(
-        r"(?:至|放到|放入|放进|放在|摆放在|摆到|置于|移到|移送到|移送至|搬运到|搬运至|转移到|转移至|送到|上料到|倒入|倒进|倾倒|注入|堆到|叠到|码放在)"
+        r"(?:至|放到|放入|放进|放在|摆放在|摆到|置于|移到|移送到|移送至|搬运到|搬运至|转移到|转移至|送到|送回|装入|收入|归入|安置到|转交到|转送到|改送到|引入|灌到|上料到|倒入|倒进|倾倒|倾入|注入|堆到|叠到|码放在)"
         r"\s*([^，。；,;]+)", text
     )
     if destination_match:
@@ -185,21 +236,84 @@ def parse_roles(instruction: str, actions: List[str]) -> tuple[List[SemanticEnti
     )
     if fetch_destination and "destination" not in role_refs:
         destination_text = fetch_destination.group(1).strip()
-        destination_hit = _find_mention(destination_text, after=fetch_destination.start(1))
+        # Search the captured phrase itself. The captured substring has its
+        # own coordinate system; using the original absolute offset makes a
+        # valid noun such as “送回托盘” look like an unresolved object.
+        destination_hit = _find_mention(destination_text)
         if destination_hit:
             add("destination", destination_hit)
         elif not any(cue in destination_text for cue in ("机器人身边", "这边", "那里", "现场")):
             add_open("destination", destination_text, fetch_destination.start(1))
+
+    # A delivery command may put the object before the retrieval verb, as in
+    # “把蓝色盒子取回收纳箱”.  Do this before the post-verb FETCH pattern so
+    # the receiving bin cannot be mistaken for the manipulated object.
+    if "FETCH" in actions and "theme" not in role_refs:
+        fetch_theme_before = re.search(
+            r"(?:把|将)\s*(?P<theme>[^，。；,;]+?)\s*(?:取回|带回|拿回|带到)"
+            r"(?=[^，。；,;]*(?:收纳箱|接收|收取|回收|托盘|机器人|身边|这边))",
+            text,
+        )
+        if fetch_theme_before:
+            add("theme", _find_mention(text, after=fetch_theme_before.start("theme")))
+
+    # FETCH often expresses the source and manipulated object together:
+    # “从桌面取出红色盒子送回托盘”.  The generic source/theme fallback can
+    # otherwise bind the table twice and lose the box.  Extract the object
+    # after the retrieval verb as a semantic theme; grounding still chooses
+    # the scene-owned id.
+    if "FETCH" in actions and "theme" not in role_refs:
+        fetch_theme = re.search(
+            r"(?:取出|取回|拿回|带回|拿来|带来)\s*(?P<theme>[^，。；,;]+?)"
+            r"(?=(?:送回|带到|送到|放到|放入|交给|，|。|；|,|;|$))",
+            text,
+        )
+        if fetch_theme:
+            add("theme", _find_mention(text, after=fetch_theme.start("theme")))
     # “向托盘倾倒” is a POUR destination, while “向托盘方向推动” is only
     # a PUSH direction and must not become a physical destination role.
     pour_destination_match = re.search(
-        r"向\s*([^，。；,;]+?)\s*(?=(?:倾倒|倒入|倒进|注入))", text
+        r"向\s*([^，。；,;]+?)\s*(?=(?:倾倒|倒入|倒进|注入|加料))", text
     )
     if pour_destination_match and "destination" not in role_refs:
         add("destination", _find_mention(pour_destination_match.group(1), after=0))
     source_match = re.search(r"从([^，。；,;]+?)(?:移|搬|转|送|运)", text)
     if source_match:
         add("source", _find_mention(source_match.group(1), after=0))
+
+    # Direction-first POUR clauses place the destination before the source,
+    # e.g. ``向托盘倾空黄色书本``. Extract both roles together so the generic
+    # theme fallback cannot mistake the destination tray for the pourable
+    # object.
+    if "POUR" in actions:
+        directed_pour = re.search(
+            r"(?:向|朝向|倒向|倾向)\s*(?P<destination>[^，。；,;]+?)\s*"
+            r"(?P<verb>倾空|倾倒|倒入|倒进|注入|灌入|灌进|导入|转注到)\s*"
+            r"(?P<theme>[^，。；,;]+)",
+            text,
+        )
+        if directed_pour:
+            add("destination", _find_mention(directed_pour.group("destination"), after=0))
+            add("theme", _find_mention(directed_pour.group("theme"), after=0))
+
+    # Contents language still refers to the source container: “药瓶的内部
+    # 物料” and “书本里的东西” are not new object categories. Preserve the
+    # containing object as POUR.theme and leave the material itself to the
+    # execution skill template.
+    if "POUR" in actions and "theme" not in role_refs:
+        contents_theme = re.search(
+            r"(?P<theme>[^，。；,;]+?)(?:的内部物料|内部物料|里面的东西|的东西|内容物)",
+            text,
+        )
+        if contents_theme:
+            add("theme", _find_mention(text, after=contents_theme.start("theme")))
+    if "POUR" in actions and "theme" not in role_refs:
+        pour_target = re.search(
+            r"(?:对|给)\s*(?P<theme>[^，。；,;]+?)(?:的)?(?:进行)?加料",
+            text,
+        )
+        if pour_target:
+            add("theme", _find_mention(text, after=pour_target.start("theme")))
     recipient_match = re.search(r"(?:递交给|递给|交给|递到|交到|送到|给)([^，。；,;]+)", text)
     if recipient_match:
         add("recipient", _find_mention(recipient_match.group(1), after=0))
@@ -220,6 +334,18 @@ def parse_roles(instruction: str, actions: List[str]) -> tuple[List[SemanticEnti
                 add("destination", (mention, handoff_surface.start(1) + local_start, category, attrs))
             elif not hit:
                 add_open("destination", handoff_surface.group(1), handoff_surface.start(1))
+
+    # STACK phrases such as ``和托盘叠合起来`` name the support object before
+    # the stacking verb. Capture that pair before generic destination rules,
+    # whose verb list could otherwise bind the trailing word ``起来``.
+    if "STACK" in actions and "destination" not in role_refs:
+        stack_pair = re.search(
+            r"(?:与|和|跟)\s*(?P<destination>[^，。；,;]+?)\s*"
+            r"(?=(?:上下相叠|叠合|叠放|形成堆叠))",
+            text,
+        )
+        if stack_pair:
+            add("destination", _find_mention(stack_pair.group("destination"), after=0))
 
     # A physical tray/position introduced by "交给" is not a human
     # recipient. Remove the recipient interpretation when the same clause
@@ -328,9 +454,9 @@ def parse_roles(instruction: str, actions: List[str]) -> tuple[List[SemanticEnti
             else:
                 add_open("destination", destination_surface.group(1), destination_surface.start(1))
         destination_phrase = re.search(
-            r"(?:安顿到|落在|归置进|送到|转送至|调运到|输送到|改送至|调拨进|转运到|搬至|转交至|移送到|"
+            r"(?:安顿到|安置到|落在|归置进|归入|送到|送回|转送至|转送到|调运到|输送到|改送至|改送到|调拨进|转运到|搬至|转交至|转交到|移送到|"
             r"放到|放入|放进|装入|安放于|归置于|摆放于|堆到|叠到|码到|叠置到|摞到|压在|灌进|灌入|"
-            r"注入|倒进|倾入|导入|转注到|送回|带到|取到)\s*([^，。；,;]+)",
+            r"注入|倒进|倾入|导入|引入|灌到|转注到|送回|带到|取到)\s*([^，。；,;]+)",
             text,
         )
         if destination_phrase and "destination" not in role_refs:
@@ -358,6 +484,24 @@ def parse_roles(instruction: str, actions: List[str]) -> tuple[List[SemanticEnti
                 add("destination", (mention, open_destination.start(1) + local_start, category, attrs))
             else:
                 add_open("destination", destination_text, open_destination.start(1))
+
+    # Locative placement can put the support before the final verb:
+    # “让工件在收纳箱中放稳”.  Keep both semantic roles explicit instead of
+    # falling back to the first noun (which is often the container).
+    if "PLACE" in actions and "destination" not in role_refs:
+        locative_place = re.search(
+            r"在\s*(?P<destination>[^，。；,;]+?)(?:中|里|上)\s*放稳",
+            text,
+        )
+        if locative_place:
+            add("destination", _find_mention(text, after=locative_place.start("destination")))
+    if "PLACE" in actions and "theme" not in role_refs:
+        locative_theme = re.search(
+            r"(?:让|使)\s*(?P<theme>[^，。；,;]+?)\s*在\s*[^，。；,;]+?(?:中|里|上)\s*放稳",
+            text,
+        )
+        if locative_theme:
+            add("theme", _find_mention(text, after=locative_theme.start("theme")))
 
     # STACK has an explicit relation form ("with the tray, one above the
     # other") in which the destination noun is not preceded by a movement
@@ -392,7 +536,7 @@ def parse_roles(instruction: str, actions: List[str]) -> tuple[List[SemanticEnti
 
     if "STACK" in actions and "destination" not in role_refs:
         stack_surface = re.search(
-            r"(?:\u6210\u4e3a|\u5b89\u7f6e\u6210)\s*([^，。；,;]+?)(?:\u7684)?(?:\u4e0a\u5c42\u7269\u4f53|\u4e0a\u9762\u7684\u90a3\u4e00\u4ef6|\u9876\u5c42)",
+            r"(?:\u6210\u4e3a|\u5b89\u7f6e\u6210|\u653e\u6210|\u6446\u6210)\s*([^，。；,;]+?)(?:\u7684)?(?:\u4e0a\u5c42\u7269\u4f53|\u4e0a\u9762\u7684\u90a3\u4e00\u4ef6|\u9876\u5c42)",
             text,
         )
         if stack_surface:
@@ -412,6 +556,44 @@ def parse_roles(instruction: str, actions: List[str]) -> tuple[List[SemanticEnti
     if wait_match:
         add("condition", _find_mention(wait_match.group(1), after=0))
         add("theme", _find_mention(wait_match.group(2), after=0))
+
+    # ``让夹具把红色杯子控住`` and similar agent/tool constructions put the
+    # manipulated object directly after 把/将. Bind that direct object before
+    # the broad first-noun fallback, so a fixture or gripper is not promoted
+    # to the theme merely because it appears earlier in the sentence.
+    if "theme" not in role_refs:
+        direct_theme = re.search(
+            r"(?:把|将|请将)\s*(?P<theme>[^，。；,;]+?)\s*"
+            r"(?=(?:送到|送至|运到|移到|搬到|转移到|转运到|放到|放在|放入|"
+            r"拿起|拿住|抓住|抓取|夹住|控住|提起|取回|带回|带到|纳入|顶开|滑过|滑过去|滑动到|递给|交给|推开|倾倒|倾空|"
+            r"叠合|叠放|摞到|堆到|$))",
+            text,
+        )
+        if direct_theme:
+            # ``不要把旁边的同类物体混进去`` is a prohibition clause, not
+            # the manipulated object.  Do not let the generic ``把`` pattern
+            # claim it before the positive handover clause is parsed.
+            command_prefix = text[max(0, direct_theme.start() - 6):direct_theme.start()]
+            if re.search(r"(?:不要|别|禁止|避免)\s*$", command_prefix):
+                direct_theme = None
+        if direct_theme:
+            # Search the original instruction at the captured span.  Running
+            # the noun lookup on only the captured suffix loses descriptors
+            # that occur before ``把`` (for example the scene-position prefix
+            # used by the open-language acceptance set).
+            add("theme", _find_mention(text, after=direct_theme.start("theme")))
+
+    # Some handover clauses put the manipulated object after the delivery
+    # verb: ``向操作员交付绿色盒子``.  The recipient parser above owns
+    # ``操作员``; this pattern owns only the delivered object and leaves the
+    # final scene ID to deterministic grounding.
+    if "HANDOVER" in actions and "theme" not in role_refs:
+        handover_theme = re.search(
+            r"(?:交付|递交|转交)\s*(?P<theme>[^，。；,;]+?)(?=[，。；,;]|$)",
+            text,
+        )
+        if handover_theme:
+            add("theme", _find_mention(text, after=handover_theme.start("theme")))
 
     surface_theme_match = re.search(
         r"(?:把|将|请将)\s*(?:桌上|桌面上|台上|托盘上|工位上)的"
@@ -567,6 +749,14 @@ def parse_roles(instruction: str, actions: List[str]) -> tuple[List[SemanticEnti
             color = COLORS.get(color_only.group(1))
             mention = color_only.group(1) + "的"
             add("obstacle", (mention, color_only.start(1), "object", {"color": color}))
+
+    # A vague peer reference such as ``不要把旁边的同类物体混进来`` does not
+    # identify a physical entity. Do not fabricate an obstacle role that will
+    # later make an otherwise complete HANDOVER/PUSH task unexecutable.
+    if vague_peer_avoidance:
+        vague_ref = role_refs.pop("obstacle", None)
+        if vague_ref and not any(ref == vague_ref for ref in role_refs.values()):
+            entities = [item for item in entities if item.local_ref != vague_ref]
 
     # Open industrial names are still valid mentions even when the compact
     # lexicon has no category alias (e.g. “镜片盒”, “电源箱”).

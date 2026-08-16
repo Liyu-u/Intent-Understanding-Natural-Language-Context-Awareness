@@ -11,7 +11,7 @@ from robot_intent_agent.schemas.semantic_task_graph import EvidenceSpan, Semanti
 def parse_conditions(instruction: str) -> List[SemanticCondition]:
     text = instruction or ""
     patterns = (
-        (r"(?:先不动作|先观察一会儿|保持当前状态|让系统)?\s*[,，、]?\s*(?:等到|等待|等|待)\s*((?:目标|场景|工位|传送过程|运动)(?:还有位移|完全)?)(?:静止|停止|稳定|不再变化|结束|完成)", "WAIT_UNTIL"),
+        (r"(?:先不动作|先别动作|先观察一会儿|保持当前状态|让系统)?\s*[,，、]?\s*(?:等到|等待|等|待)\s*((?:目标|场景|工位|传送过程|运动)(?:还有位移|完全)?)(?:静止|停止|稳定|不再变化|结束|完成)", "WAIT_UNTIL"),
         (r"((?:目标|场景|工位|传送过程))\s*(?:还有位移|未停止|在移动)\s*时\s*(?:暂缓操作|先不动作|等待)", "WAIT_UNTIL"),
         (r"(?:在|到)\s*((?:目标|场景|工位))\s*(?:稳住|静止|停止|稳定)以前\s*(?:不要开始|暂缓|延后)", "WAIT_UNTIL"),
         (r"保持等待?直到(.{1,30}?)(?:停止|稳定|完成|移动结束)", "WAIT_UNTIL"),
@@ -24,7 +24,22 @@ def parse_conditions(instruction: str) -> List[SemanticCondition]:
         (r"(?:先不动作|先观察一会儿|保持当前状态|让系统)?\s*[,，、]?\s*(?:等到|等待|等|待)\s*((?:目标|场景|工位|传送过程|运动)(?:还有位移|完全)?)(?:静止|停止|稳定|不再变化|结束|完成)", "WAIT_UNTIL"),
         (r"((?:目标|场景|工位|传送过程))\s*(?:还有位移|未停止|在移动|稳住)\s*时\s*(?:暂缓操作|先不动作|等待)", "WAIT_UNTIL"),
         (r"(?:在|到)\s*((?:目标|场景|工位))\s*(?:稳住|静止|停止|稳定)以前\s*(?:不要开始|暂缓|延后)", "WAIT_UNTIL"),
-        (r"(?:保持当前状态|暂时保持等待|待场景恢复稳定后继续|把后续动作延后到目标静止|等移动状态消失后再处理)", "WAIT_UNTIL"),
+        (r"(?:保持当前状态|暂时保持等待|继续保持不动|先暂停|待场景恢复稳定后继续|把后续动作延后到目标静止|等移动状态消失后再处理)", "WAIT_UNTIL"),
+        # Open wording families for the fixed WAIT template.
+        (r"(?:目标|场景|工位|传送过程|工件|运动状态)[^，。；,;]{0,16}(?:还在变化|未停止|在移动|不再晃动|运动结束|结束后)"
+         r"[^，。；,;]{0,12}(?:保持等待|等待|再继续|继续|再处理)", "WAIT_UNTIL"),
+        (r"(?:保持等待|等待|暂缓操作|先别动作|先不动作)[^，。；,;]{0,24}"
+         r"(?:现场|场景|工位|目标|工件|运动状态)[^，。；,;]{0,16}"
+         r"(?:不再变化|停止|静止|稳定|结束|完成)", "WAIT_UNTIL"),
+        (r"(?:等|待)[^，。；,;]{0,24}(?:工位|工件|目标|现场|传送过程)[^，。；,;]{0,12}"
+         r"(?:不再晃动|运动结束|停止|稳定|完成)后(?:再继续|继续|再处理)?", "WAIT_UNTIL"),
+        (r"先让[^，。；,;]{0,20}运动状态[^，。；,;]{0,10}(?:消失|停止|结束)[^，。；,;]{0,10}(?:再|然后)", "WAIT_UNTIL"),
+        (r"先不要执行动作[^，。；,;]{0,12}(?:等|待)[^，。；,;]{0,24}(?:停止|静止|稳定|停下|结束)", "WAIT_UNTIL"),
+        (r"(?:把)?后续动作延后到[^，。；,;]{0,24}(?:停止位移|停止|静止|稳定|结束)", "WAIT_UNTIL"),
+        (r"(?:继续等候|继续等待)[^，。；,;]{0,12}(?:到|直到)[^，。；,;]{0,20}(?:停止|静止|稳定|不再变化|结束)", "WAIT_UNTIL"),
+        (r"先观察一会儿[^，。；,;]{0,12}(?:待|等)[^，。；,;]{0,20}(?:停下|停止|静止|稳定)", "WAIT_UNTIL"),
+        (r"目标尚未稳住[^，。；,;]{0,12}(?:暂时不要开始|先不要开始|暂缓操作)", "WAIT_UNTIL"),
+        (r"(?:待|等)[^。]{0,36}(?:停止运动|运动停止|运动结束)[^。]{0,12}(?:后继续|继续|再进行)", "WAIT_UNTIL"),
     )
     result: List[SemanticCondition] = []
     for pattern, predicate in patterns:
@@ -93,6 +108,25 @@ def parse_conditions(instruction: str) -> List[SemanticCondition]:
         existing.on_false_text = false_text
         existing.on_true_action = _action_from_text(true_text)
         existing.on_false_action = _action_from_text(false_text)
+    wait_family = re.search(
+        r"(?:先别动作|先不要执行动作|先不动作|先暂停|暂缓操作|先观察一会儿|"
+        r"后续动作延后到|目标尚未稳住|继续等候|继续等待|保持等待|"
+        r"先让运动状态消失)[^。]{0,60}"
+        r"(?:停止|停下|静止|稳定|恢复稳定|不再变化|结束|完成|不要开始|再进行)",
+        text,
+    )
+    if wait_family and not any(
+            item.predicate == "WAIT_UNTIL" and item.evidence_span == wait_family.group(0)
+            for item in result
+    ):
+        start, end = wait_family.span()
+        evidence = EvidenceSpan(value=wait_family.group(0), source_text=text,
+                                start=start, end=end, confidence=0.95,
+                                rule_id="condition.wait.family")
+        result.append(SemanticCondition(
+            condition_id=f"condition-wait-family-{start}", predicate="WAIT_UNTIL",
+            value=wait_family.group(0), evidence_span=wait_family.group(0), evidence=[evidence],
+        ))
     # Overlapping WAIT_UNTIL patterns can describe the same clause (for
     # example “保持等待直到场景稳定”).  Keep one graph atom per span so the
     # downstream WAIT action does not receive duplicate conditions.

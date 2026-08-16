@@ -56,6 +56,69 @@ def test_specialized_action_wins_over_embedded_generic_verb():
     assert graph.events[0].theme_ref and graph.events[0].destination_ref
 
 
+def test_surface_delivery_is_place_not_transfer():
+    graph = RuleSemanticParser().parse("请把红色杯子送到托盘的内部").graph
+    assert [event.action for event in graph.events] == ["PLACE"]
+    assert graph.events[0].theme_ref and graph.events[0].destination_ref
+
+
+def test_tool_agent_phrase_binds_the_direct_object_as_theme():
+    graph = RuleSemanticParser().parse("让夹具把红色杯子牢牢控住").graph
+    assert graph.events[0].action == "GRASP"
+    theme = graph.entity(graph.events[0].theme_ref)
+    assert theme is not None
+    assert theme.category == "cup"
+    assert theme.attributes.get("color") == "red"
+
+
+def test_stack_pair_and_direction_first_pour_bind_distinct_roles():
+    stack = RuleSemanticParser().parse("把白色药瓶和托盘叠合起来").graph
+    assert stack.events[0].action == "STACK"
+    assert stack.entity(stack.events[0].theme_ref).category == "medicine_bottle"
+    assert stack.entity(stack.events[0].destination_ref).category == "tray"
+
+    pour = RuleSemanticParser().parse("向托盘倾空黄色书本").graph
+    assert pour.events[0].action == "POUR"
+    assert pour.entity(pour.events[0].theme_ref).category == "book"
+    assert pour.entity(pour.events[0].destination_ref).category == "tray"
+
+
+def test_fetch_prefers_unique_declared_receive_zone():
+    scene = SemanticSceneBuilder().build([
+        RawObjectPercept(
+            name="fixture", object_id="fixture-01", x=0.40, y=0.30, z=0.05,
+            width=0.20, height=0.10, depth=0.20,
+            extra_attrs={"_upstream_affordances": ["fixed", "container"]},
+        ),
+        RawObjectPercept(
+            name="tray", object_id="receive-01", x=0.60, y=-0.20, z=0.05,
+            width=0.20, height=0.05, depth=0.20,
+            extra_attrs={"_upstream_affordances": ["fixed", "container", "robot_receive_zone"]},
+        ),
+        RawObjectPercept(
+            name="blue bottle", object_id="bottle-01", x=0.20, y=0.10, z=0.05,
+            width=0.05, height=0.10, depth=0.05, color="blue",
+        ),
+    ])
+    result = SemanticCompiler().compile("把蓝色瓶子带到机器人身边", scene=scene)
+    event = result.graph.events[0]
+    assert event.action == "FETCH"
+    receive_id = next(
+        item.id for item in scene.objects
+        if item.attributes.get("_perception_object_id") == "receive-01"
+    )
+    assert result.graph.entity(event.destination_ref).entity_id == receive_id
+
+
+def test_vague_same_class_peer_reference_does_not_create_fake_prohibition():
+    graph = RuleSemanticParser().parse(
+        "把绿色盒子递交给人手，不要把旁边的同类物体混进来"
+    ).graph
+    assert graph.events[0].action == "HANDOVER"
+    assert graph.events[0].obstacle_refs == []
+    assert graph.prohibitions == []
+
+
 def test_unsupported_sensing_verb_is_not_downgraded_to_grasp():
     assert parse_action_candidates("请读取温度红色盒子") == []
     assert RuleSemanticParser().parse("请读取温度红色盒子").graph.events == []

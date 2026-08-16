@@ -47,7 +47,12 @@ def audit_case(case: dict[str, Any]) -> list[str]:
         if eid and eid not in ids: errors.append(f"EXPECTED_ID_NOT_IN_SCENE:{key}")
     for eid in exp.get("obstacle_entity_ids", []):
         if eid not in ids: errors.append("EXPECTED_OBSTACLE_NOT_IN_SCENE")
-    if exp.get("plan_status") == "READY" and not exp.get("theme_entity_id"):
+    # WAIT is a condition-only action in capability_contract.v1 and
+    # legitimately has no theme entity. Other executable actions still need
+    # a grounded target in the oracle.
+    if (exp.get("plan_status") == "READY" and
+            exp.get("action") != "WAIT" and
+            not exp.get("theme_entity_id")):
         errors.append("READY_WITHOUT_EXPECTED_THEME")
     return sorted(set(errors))
 

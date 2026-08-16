@@ -32,6 +32,12 @@ def find_action_constraint_conflicts(
     theme = getattr(parsed_task, "theme", None)
     destination = getattr(parsed_task, "destination", None) or getattr(parsed_task, "support_surface", None)
     recipient = getattr(parsed_task, "recipient", None)
+    semantic_graph = getattr(parsed_task, "semantic_task_graph", None) or {}
+    graph_events = semantic_graph.get("events", []) if isinstance(semantic_graph, dict) else []
+    theme_local_refs = {
+        event.get("theme_ref") for event in graph_events
+        if isinstance(event, dict) and event.get("theme_ref")
+    }
 
     # Hard action preconditions.  Missing roles are unsafe, not a suggestion.
     if scene is not None and theme is not None and getattr(theme, "entity_id", None):
@@ -73,7 +79,7 @@ def find_action_constraint_conflicts(
         prohibited_action = _enum_value(_field(prohibition, "action"))
         scoped_to_theme = not target_ref or not theme or target_ref in {
             getattr(theme, "entity_id", None), getattr(theme, "mention", None)
-        }
+        } or target_ref in theme_local_refs
         if ptype == "NO_CONTACT" and scoped_to_theme and action in {"GRASP", "PLACE", "HANDOVER", "TRANSFER"}:
             reasons.append("ACTION_CONSTRAINT_CONFLICT:NO_CONTACT")
         if ptype == "FORBID_ACTION":
@@ -88,7 +94,8 @@ def find_action_constraint_conflicts(
         if ptype != "FORBID_ACTION":
             continue
         target_ref = _field(prohibition, "target_ref")
-        if theme and target_ref in {getattr(theme, "entity_id", None), getattr(theme, "mention", None)}:
+        if theme and (target_ref in {getattr(theme, "entity_id", None), getattr(theme, "mention", None)}
+                      or target_ref in theme_local_refs):
             span = str(_field(prohibition, "evidence_span", "")).lower()
             action_words = {
                 "GRASP": ("抓", "拿", "取", "grasp", "grab", "pick"),

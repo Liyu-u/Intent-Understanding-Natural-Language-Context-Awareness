@@ -181,7 +181,10 @@ class RuleSemanticParser:
                 branch_text = branch_text.strip(" ，,")
             theme_ref = None if branch_condition and branch_text else role_refs.get("theme")
             if action == "WAIT":
-                theme_ref = role_refs.get("theme")
+                # WAIT is a condition-only task in the public contract. A
+                # noun mentioned while describing the monitored state is not
+                # an object manipulation target.
+                theme_ref = None
             elif branch_condition and branch_text:
                 branch_entities, branch_roles = parse_roles(branch_text, [action])
                 for branch_entity in branch_entities:
@@ -254,7 +257,17 @@ class RuleSemanticParser:
             metadata={"action_candidates": [candidate.__dict__ for candidate in action_candidates],
                       "role_refs": role_refs, "parser": "rules",
                       "manner": _extract_manner(text),
-                      "motion_state": "moving" if re.search(r"正在移动|移动中|动态", text) else "static"},
+                      "motion_state": "moving" if re.search(r"正在移动|移动中|动态", text) else "static",
+                      "unsupported_action_evidence": (
+                          re.search(
+                              r"读取|读出|测量|测温|检测温度|清洗|切割|焊接|钻孔|装配|拧紧|涂胶|擦拭",
+                              text, re.IGNORECASE,
+                          ).group(0)
+                          if re.search(
+                              r"读取|读出|测量|测温|检测温度|清洗|切割|焊接|钻孔|装配|拧紧|涂胶|擦拭",
+                              text, re.IGNORECASE,
+                          ) else None
+                      )},
         )
         if re.search(
                 "\u76ee\u6807\u4e0d\u660e\u786e|\u76ee\u6807\u4e0d\u6e05\u695a|\u4e0d\u660e\u786e|\u4e0d\u786e\u5b9a",

@@ -21,6 +21,29 @@ class NegationParser:
         for entity in entities:
             if entity.mention and entity.mention in text:
                 last_explicit_entity = entity.local_ref
+
+        # State-negated action clauses are safety-critical even when they do
+        # not use the ordinary ``不要/禁止`` prefix.  For example,
+        # ``拿起杯子，同时保持它没有被拿起`` explicitly requires and forbids
+        # the same transition.  Preserve that contradiction as a prohibition
+        # on the already parsed theme; the validator will block execution.
+        contradictory_action = re.compile(
+            r"(?:同时|并且|但|却)?\s*(?:保持|确保|维持|仍然保持)"
+            r"[^，。；,;]{0,18}?(?:没有|未|不再|不能)"
+            r"[^，。；,;]{0,12}?(?:拿起|抓住|抓取|拿住|握住|夹住|提起|提起来|放下|放置|移动)",
+        )
+        for index, match in enumerate(contradictory_action.finditer(text)):
+            target_ref = next((event.theme_ref for event in events if event.theme_ref), None)
+            evidence = EvidenceSpan(
+                value=match.group(0), source_text=text, start=match.start(),
+                end=match.end(), confidence=0.99, rule_id="negation.action_contradiction",
+            )
+            result.append(SemanticProhibition(
+                prohibition_id=f"contradiction-{index + 1}",
+                type="FORBID_ACTION", target_ref=target_ref,
+                scope_event_ids=[event.event_id for event in events],
+                evidence_span=match.group(0), evidence=[evidence], propagated_to=[],
+            ))
         negation_pattern = (
             r"(?:" + self.NEGATION + r")"
             r"(?:拿|取|抓|碰|接触|touch|contact|touching|碰倒)?"
@@ -29,6 +52,11 @@ class NegationParser:
         )
         for index, match in enumerate(re.finditer(negation_pattern, text, re.IGNORECASE)):
             span = match.group(0)
+            # ``同类物体/旁边的同类对象`` is a vague peer constraint, not a
+            # uniquely bindable entity reference. Keep it as provenance only;
+            # explicit named objects continue through the normal safety path.
+            if re.search(r"(?:旁边的|附近的|周围的)?(?:同类物体|同类对象|同样的物体|同类目标)", span):
+                continue
             if re.search(r"(?:力|力量|抓力|force|velocity|速度|不超过|最多|至少|超过|低于|高于|<=|>=|<|>)\s*\d", span, re.IGNORECASE):
                 continue
             target_ref: Optional[str] = None

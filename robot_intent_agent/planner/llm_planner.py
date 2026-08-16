@@ -1058,6 +1058,31 @@ def _semantic_candidate_from_wire(raw: Dict[str, Any], instruction: str, source:
         str(item.get("local_ref")) for item in graph_data["entities"]
         if isinstance(item, dict) and item.get("local_ref")
     }
+    # A provider occasionally emits a role reference (usually e1/e2) while
+    # omitting the corresponding entity atom. Keep the semantic action and
+    # represent the missing entity as explicitly unresolved; grounding will
+    # either bind it from a compatible scene description or force clarification.
+    # The placeholder has no evidence and can never become a physical ID by
+    # itself.
+    for event in graph_data["events"]:
+        if not isinstance(event, dict):
+            continue
+        refs = [event.get("theme_ref"), event.get("destination_ref"),
+                event.get("source_ref"), event.get("recipient_ref"),
+                *(event.get("obstacle_refs") or [])]
+        for ref in refs:
+            if not ref or str(ref) in known_refs:
+                continue
+            placeholder = str(ref)
+            graph_data["entities"].append({
+                "local_ref": placeholder,
+                "mention": "",
+                "category": "object",
+                "attributes": {"_grounding_unresolved": True, "_llm_placeholder": True},
+                "evidence_spans": [],
+                "evidence": [],
+            })
+            known_refs.add(placeholder)
     for index, event in enumerate(graph_data["events"]):
         if not isinstance(event, dict):
             continue
@@ -1127,8 +1152,11 @@ def _semantic_candidate_from_wire(raw: Dict[str, Any], instruction: str, source:
             evidence = evidence_text(item)
             if evidence and any(value in instruction for value in evidence):
                 valid_items.append(item)
-            elif (collection_name == "entities" and isinstance(item.get("candidate_key"), str)
-                  and re.fullmatch(r"scene-object-\d+", item["candidate_key"])):
+            elif (collection_name == "entities" and (
+                    bool(item.get("_llm_placeholder")) or
+                    (isinstance(item.get("candidate_key"), str)
+                     and re.fullmatch(r"scene-object-\d+", item["candidate_key"]))
+            )):
                 # A scene candidate key is grounded evidence supplied by the
                 # read-only perception context, not a physical ID guessed by
                 # the provider.  Retain the entity atom so the compiler can
@@ -1502,8 +1530,9 @@ class LLMPlanner(TaskPlannerInterface):
                     "ambiguities": [], "evidence_spans": [], "confidence": 0.0,
                 }],
             }, ensure_ascii=False, separators=(",", ":")),
-            "Return exactly one candidate. Use local_ref values such as e1/e2 for event role references.",
-            "Use scene-object-N only as entity.candidate_key. Never output physical object IDs or execution state.",
+            "Return exactly one candidate. Every event role reference must point to an entity declared in this same candidate. Declare the entity with its language description before referencing it; never invent an undeclared e1/e2 reference.",
+            "Use scene-object-N only as entity.candidate_key and never as an event role reference. Never output physical object IDs or execution state.",
+            "If a role is not described clearly in the instruction, omit that role so deterministic grounding can request clarification. Do not fill it with a guessed object.",
             "Return JSON only.",
         ])
         return "\n".join(parts)

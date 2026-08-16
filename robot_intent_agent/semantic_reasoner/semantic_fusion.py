@@ -187,20 +187,25 @@ class SemanticFusion:
         existing = normalize_action(current.action)
         if proposed == existing or proposed == "CUSTOM" or not evidence:
             return proposed == existing
-        # Once the deterministic parser has produced a supported action, the
-        # LLM is a repair provider, not a second action classifier.  Changing
-        # a valid action was the dominant source of negative transfer in the
-        # open-language evaluation (for example WAIT->GRASP and POUR->TRANSFER).
-        # Action recovery remains possible when the rule path is CUSTOM or
-        # otherwise unresolved; those are the cases where the provider adds
-        # genuine value.
-        if existing in ACTION_SCHEMAS and existing != "CUSTOM":
-            return False
-        # An explicit wait/monitor condition is a protected semantic fact.
-        # A provider must not turn "delay until stable/visible" into a
-        # physical action merely because it recognized an object or motion
-        # phrase.  The rule graph remains the safe authority for this case.
-        if existing == "WAIT" and (current.condition_refs or graph.conditions):
+        # Action correction is allowed at the semantic layer.  The old
+        # implementation treated every deterministic action as immutable,
+        # which made the LLM unable to correct the exact errors it was meant
+        # to solve (FETCH/TRANSFER/PLACE, STACK/PLACE, and dynamic grasp).
+        # Safety is retained by requiring source evidence and validating the
+        # proposed template's roles below; the scene grounder remains the
+        # identity authority.
+        wait_evidence = bool(re.search(
+            r"等待|等到|直到|暂缓|先别动作|先不动作|保持当前状态|保持等待|"
+            r"停止|静止|稳定|不再变化|运动结束|wait|stable",
+            evidence or "", re.IGNORECASE,
+        ))
+        if proposed == "WAIT":
+            return bool(graph.conditions and any(
+                item.predicate == "WAIT_UNTIL" for item in graph.conditions
+            ) and wait_evidence)
+        if existing == "WAIT":
+            # A condition-only WAIT is never upgraded to a physical action by
+            # a provider's incidental object or motion mention.
             return False
         schema = get_action_schema(proposed)
         refs = {
@@ -213,6 +218,22 @@ class SemanticFusion:
             return False
         # Never let a generic provider answer erase a specialized rule event.
         specialized = {"DYNAMIC_GRASP", "HANDOVER", "TRANSFER", "FETCH", "POUR", "STACK"}
+        if existing == "TRANSFER" and proposed == "PLACE" and re.search(
+                r"\u6536\u8fdb|\u6536\u7eb3|\u6536\u5165|\u88c5\u8fdb|\u653e\u5165|\u653e\u8fdb|\u653e\u56de|\u9001\u5165|\u843d\u5165|\u5f52\u5165|\u627f\u6258|\u5185|\u8868\u9762|\u4e0a\u9762|put|place",
+                evidence or "", re.IGNORECASE):
+            return True
+        if existing == "PLACE" and proposed == "TRANSFER" and re.search(
+                r"收纳|收入|放入|放进|装进|装入|归入|安置到|置入|放回|落在|承托面|支撑面|里面|内部|上面|put|place",
+                evidence or "", re.IGNORECASE):
+            return False
+        if existing == "FETCH" and proposed == "TRANSFER" and re.search(
+                r"取出|取回|送回|带回|拿回|拿来|带来|取到|送到[^，。；,;]{0,20}(?:机器人|接收)|带到[^，。；,;]{0,20}(?:收纳箱|接收|收取|回收|机器人|身边|这边|托盘)",
+                evidence or "", re.IGNORECASE):
+            # FETCH is the receive-endpoint delivery template. Do not let a
+            # generic provider rewrite “bring back to the bin/robot” as a
+            # plain TRANSFER when the deterministic candidate already
+            # carries the endpoint semantics.
+            return False
         if existing in specialized and proposed in {"GRASP", "PLACE"}:
             return False
         if existing in specialized and proposed not in specialized:
@@ -362,6 +383,16 @@ class SemanticFusion:
                         list(final_data.get("obstacle_refs") or []) +
                         (list(incoming_data.get("obstacle_refs") or [])
                          if self._has_explicit_obstacle_language(instruction) else [])))
+                    # WAIT has a condition role only.  If an action correction
+                    # changes a manipulation event into WAIT, clear inherited
+                    # manipulation roles instead of exposing a stale target
+                    # from the rule candidate.
+                    if normalize_action(final_data.get("action")) == "WAIT":
+                        final_data["theme_ref"] = None
+                        final_data["destination_ref"] = None
+                        final_data["source_ref"] = None
+                        final_data["recipient_ref"] = None
+                        final_data["obstacle_refs"] = []
                 else:
                     for name, value in incoming_data.items():
                         if name in {"entity_id", "execution_allowed", "plan_status"}:
